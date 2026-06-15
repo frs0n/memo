@@ -10,10 +10,6 @@ configs:
   Debug: debug
   Release: release
 
-packages:
-  Msplat:
-    path: ../msplat/swift
-
 settings:
   base:
     SWIFT_VERSION: 6.0
@@ -47,6 +43,3 @@ targets:
         SUPPORTS_MACCATALYST: NO
     sources:
       - path: App
-    dependencies:
-      - package: Msplat
-        product: Msplat
