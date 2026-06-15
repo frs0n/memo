@@ -1,0 +1,8 @@
+.DS_Store
+
+# Xcode / SwiftPM
+DerivedData/
+.build/
+
+# XcodeGen output
+/ios/memo.xcodeproj/

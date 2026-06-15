@@ -1,0 +1,3 @@
+[submodule "msplat"]
+	path = msplat
+	url = https://github.com/frs0n/msplat
