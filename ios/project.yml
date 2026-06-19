@@ -31,6 +31,8 @@ settingGroups:
     SWIFT_EMIT_LOC_STRINGS: YES
 
 packages:
+  Msplat:
+    path: ../msplat/swift
   MetalSplatter:
     url: https://github.com/scier/MetalSplatter.git
     from: 1.0.1
@@ -49,5 +51,9 @@ targets:
     sources:
       - path: App
     dependencies:
+      - package: Msplat
+        product: Msplat
       - package: MetalSplatter
         product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO

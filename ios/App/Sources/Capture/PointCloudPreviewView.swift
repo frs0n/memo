@@ -1,29 +1,220 @@
-import SceneKit
-import SwiftUI
-
-#if canImport(MetalSplatter)
+import Metal
+import MetalKit
 import MetalSplatter
-#endif
+import Msplat
+import SceneKit
+import SplatIO
+import SwiftUI
+import UIKit
+import simd
 
 struct PointCloudPreviewView: View {
     let package: CaptureSessionPackage
+
+    @StateObject private var trainer = ScanTrainingController()
 
     var body: some View {
         ZStack {
             Color(.systemBackground)
                 .ignoresSafeArea()
 
-            PointCloudSceneView(pointCloudURL: package.pointCloudURL)
-                .ignoresSafeArea()
+            switch trainer.phase {
+            case .idle, .training, .failed:
+                PointCloudSceneView(pointCloudURL: package.pointCloudURL)
+                    .ignoresSafeArea()
+            case .rendering(let splatURL):
+                GaussianSplatView(splatURL: splatURL)
+                    .ignoresSafeArea()
+            }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            TrainButton {}
-                .padding(.horizontal, 24)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
+            TrainingBottomBar(
+                phase: trainer.phase,
+                iteration: trainer.iteration,
+                totalIterations: trainer.totalIterations,
+                splatCount: trainer.splatCount,
+                errorMessage: trainer.errorMessage,
+                action: { trainer.start(package: package) }
+            )
         }
-        .navigationTitle("Train")
+        .navigationTitle(trainer.navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .onDisappear {
+            trainer.cancel()
+        }
+    }
+}
+
+@MainActor
+private final class ScanTrainingController: ObservableObject {
+    enum Phase: Equatable {
+        case idle
+        case training
+        case rendering(URL)
+        case failed
+    }
+
+    @Published var phase: Phase = .idle
+    @Published var iteration = 0
+    @Published var splatCount = 0
+    @Published var errorMessage: String?
+
+    let totalIterations = 2_000
+    private var task: Task<Void, Never>?
+
+    var navigationTitle: String {
+        switch phase {
+        case .idle:
+            return "Train"
+        case .training:
+            return "Training"
+        case .rendering:
+            return "3D Gaussian"
+        case .failed:
+            return "Train"
+        }
+    }
+
+    func start(package: CaptureSessionPackage) {
+        guard phase != .training else { return }
+
+        task?.cancel()
+        phase = .training
+        iteration = 0
+        splatCount = 0
+        errorMessage = nil
+
+        let rootPath = package.rootURL.path
+        let outputURL = package.rootURL.appendingPathComponent("trained_2000.splat")
+        let totalIterations = totalIterations
+
+        let controller = self
+        task = Task.detached(priority: .userInitiated) { [controller] in
+            do {
+                let splatURL = try await Self.train(
+                    datasetPath: rootPath,
+                    outputURL: outputURL,
+                    iterations: totalIterations
+                ) { stats in
+                    await controller.update(stats: stats)
+                }
+                await controller.complete(splatURL: splatURL)
+            } catch is CancellationError {
+            } catch {
+                await controller.fail(error)
+            }
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+
+    private func update(stats: TrainingProgressSnapshot) {
+        iteration = stats.iteration
+        splatCount = stats.splatCount
+    }
+
+    private func complete(splatURL: URL) {
+        iteration = totalIterations
+        phase = .rendering(splatURL)
+        task = nil
+    }
+
+    private func fail(_ error: Error) {
+        errorMessage = error.localizedDescription
+        phase = .failed
+        task = nil
+    }
+
+    private nonisolated static func train(
+        datasetPath: String,
+        outputURL: URL,
+        iterations: Int,
+        progress: @escaping @Sendable (TrainingProgressSnapshot) async -> Void
+    ) async throws -> URL {
+        let dataset = GaussianDataset(path: datasetPath, downscaleFactor: 2.0)
+        var config = TrainingConfig()
+        config.iterations = Int32(iterations)
+        config.downscaleFactor = 2.0
+        config.numDownscales = 1
+        config.bgColor = (0, 0, 0)
+
+        let trainer = GaussianTrainer(dataset: dataset, config: config)
+
+        for step in 1...iterations {
+            try Task.checkCancellation()
+            let stats = trainer.step()
+            if step == 1 || step.isMultiple(of: 10) || step == iterations {
+                await progress(
+                    TrainingProgressSnapshot(
+                        iteration: min(stats.iteration, iterations),
+                        splatCount: stats.splatCount
+                    )
+                )
+            }
+        }
+
+        try? FileManager.default.removeItem(at: outputURL)
+        trainer.exportSplat(to: outputURL.path)
+        msplatSync()
+        return outputURL
+    }
+}
+
+private struct TrainingProgressSnapshot: Sendable {
+    var iteration: Int
+    var splatCount: Int
+}
+
+private struct TrainingBottomBar: View {
+    let phase: ScanTrainingController.Phase
+    let iteration: Int
+    let totalIterations: Int
+    let splatCount: Int
+    let errorMessage: String?
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            switch phase {
+            case .idle:
+                TrainButton(action: action)
+            case .training:
+                TrainingProgressBar(iteration: iteration, totalIterations: totalIterations)
+                Text("\(iteration) / \(totalIterations)")
+                    .font(.system(.caption, design: .monospaced).weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Training iteration \(iteration) of \(totalIterations)")
+            case .rendering:
+                EmptyView()
+            case .failed:
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(errorMessage ?? "Training failed")
+                        .font(.caption)
+                        .lineLimit(2)
+                        .foregroundStyle(.red)
+                    TrainButton(action: action)
+                }
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct TrainingProgressBar: View {
+    let iteration: Int
+    let totalIterations: Int
+
+    var body: some View {
+        ProgressView(value: Double(iteration), total: Double(max(totalIterations, 1)))
+            .progressViewStyle(.linear)
+            .tint(.primary)
+            .animation(.linear(duration: 0.12), value: iteration)
     }
 }
 
@@ -47,6 +238,251 @@ private struct TrainButton: View {
                 .controlSize(.large)
                 .accessibilityLabel("Train")
         }
+    }
+}
+
+private struct GaussianSplatView: UIViewRepresentable {
+    let splatURL: URL
+
+    func makeCoordinator() -> GaussianSplatRendererCoordinator {
+        GaussianSplatRendererCoordinator()
+    }
+
+    func makeUIView(context: Context) -> MTKView {
+        let view = MTKView()
+        view.backgroundColor = .systemBackground
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        view.device = MTLCreateSystemDefaultDevice()
+        view.colorPixelFormat = .bgra8Unorm_srgb
+        view.depthStencilPixelFormat = .depth32Float
+        view.sampleCount = 1
+
+        if let renderer = GaussianSplatRenderer(view: view) {
+            context.coordinator.renderer = renderer
+            view.delegate = renderer
+            renderer.load(url: splatURL)
+        }
+
+        return view
+    }
+
+    func updateUIView(_ uiView: MTKView, context: Context) {
+        context.coordinator.renderer?.load(url: splatURL)
+    }
+}
+
+private final class GaussianSplatRendererCoordinator {
+    var renderer: GaussianSplatRenderer?
+}
+
+@MainActor
+private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
+    private let view: MTKView
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let inFlightSemaphore = DispatchSemaphore(value: 3)
+    private let gestureDelegate = SimultaneousSplatGestureDelegate()
+
+    private var splatRenderer: SplatRenderer?
+    private var loadedURL: URL?
+    private var drawableSize: CGSize = .zero
+    private var lastFrameDate = Date()
+    private var yaw: Float = 0
+    private var pitch: Float = 0
+    private var panOffset = SIMD2<Float>(0, 0)
+    private var distance: Float = 7
+    private var gestureStartYaw: Float = 0
+    private var gestureStartPitch: Float = 0
+    private var gestureStartPanOffset = SIMD2<Float>(0, 0)
+    private var gestureStartDistance: Float = 7
+    private var autoRotates = true
+
+    init?(view: MTKView) {
+        guard let device = view.device,
+              let commandQueue = device.makeCommandQueue() else {
+            return nil
+        }
+        self.view = view
+        self.device = device
+        self.commandQueue = commandQueue
+        super.init()
+        configureGestures()
+    }
+
+    func load(url: URL) {
+        guard loadedURL != url else { return }
+        loadedURL = url
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let renderer = try SplatRenderer(
+                    device: device,
+                    colorFormat: view.colorPixelFormat,
+                    depthFormat: view.depthStencilPixelFormat,
+                    sampleCount: view.sampleCount,
+                    maxViewCount: 1,
+                    maxSimultaneousRenders: 3
+                )
+                let points = try await AutodetectSceneReader(url).readAll()
+                let chunk = try SplatChunk(device: device, from: points)
+                await renderer.addChunk(chunk)
+                splatRenderer = renderer
+            } catch {
+                splatRenderer = nil
+            }
+        }
+    }
+
+    func draw(in view: MTKView) {
+        guard let splatRenderer, splatRenderer.isReadyToRender else { return }
+        guard let drawable = view.currentDrawable else { return }
+
+        _ = inFlightSemaphore.wait(timeout: .distantFuture)
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            inFlightSemaphore.signal()
+            return
+        }
+
+        let semaphore = inFlightSemaphore
+        commandBuffer.addCompletedHandler { _ in
+            semaphore.signal()
+        }
+
+        updateRotation()
+
+        let didRender: Bool
+        do {
+            didRender = try splatRenderer.render(
+                viewports: [viewport],
+                colorTexture: view.multisampleColorTexture ?? drawable.texture,
+                colorStoreAction: view.multisampleColorTexture == nil ? .store : .multisampleResolve,
+                depthTexture: view.depthStencilTexture,
+                rasterizationRateMap: nil,
+                renderTargetArrayLength: 0,
+                to: commandBuffer
+            )
+        } catch {
+            didRender = false
+        }
+
+        if didRender {
+            commandBuffer.present(drawable)
+        }
+        commandBuffer.commit()
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        drawableSize = size
+    }
+
+    private func configureGestures() {
+        view.isMultipleTouchEnabled = true
+
+        let rotateGesture = UIPanGestureRecognizer(target: self, action: #selector(handleRotateGesture(_:)))
+        rotateGesture.minimumNumberOfTouches = 1
+        rotateGesture.maximumNumberOfTouches = 1
+        rotateGesture.delegate = gestureDelegate
+        view.addGestureRecognizer(rotateGesture)
+
+        let panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePanGesture(_:)))
+        panGesture.minimumNumberOfTouches = 2
+        panGesture.maximumNumberOfTouches = 2
+        panGesture.delegate = gestureDelegate
+        view.addGestureRecognizer(panGesture)
+
+        let pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinchGesture(_:)))
+        pinchGesture.delegate = gestureDelegate
+        view.addGestureRecognizer(pinchGesture)
+    }
+
+    @objc private func handleRotateGesture(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            autoRotates = false
+            gestureStartYaw = yaw
+            gestureStartPitch = pitch
+        case .changed:
+            let translation = gesture.translation(in: view)
+            yaw = gestureStartYaw + Float(translation.x) * 0.008
+            pitch = clamp(gestureStartPitch + Float(translation.y) * 0.008, min: -.pi * 0.48, max: .pi * 0.48)
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePanGesture(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            autoRotates = false
+            gestureStartPanOffset = panOffset
+        case .changed:
+            let translation = gesture.translation(in: view)
+            let scale = distance * 0.0014
+            panOffset = gestureStartPanOffset + SIMD2<Float>(
+                Float(translation.x) * scale,
+                -Float(translation.y) * scale
+            )
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePinchGesture(_ gesture: UIPinchGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            autoRotates = false
+            gestureStartDistance = distance
+        case .changed:
+            distance = clamp(gestureStartDistance / Float(gesture.scale), min: 1.2, max: 30)
+        default:
+            break
+        }
+    }
+
+    private var viewport: SplatRenderer.ViewportDescriptor {
+        let width = max(drawableSize.width, 1)
+        let height = max(drawableSize.height, 1)
+        let projection = matrixPerspectiveRightHand(
+            fovyRadians: Float(Angle(degrees: 62).radians),
+            aspectRatio: Float(width / height),
+            nearZ: 0.1,
+            farZ: 100
+        )
+        let viewMatrix = matrix4x4Translation(panOffset.x, panOffset.y, -distance) *
+            matrix4x4Rotation(radians: pitch, axis: SIMD3<Float>(1, 0, 0)) *
+            matrix4x4Rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0))
+        let metalViewport = MTLViewport(
+            originX: 0,
+            originY: 0,
+            width: width,
+            height: height,
+            znear: 0,
+            zfar: 1
+        )
+        return SplatRenderer.ViewportDescriptor(
+            viewport: metalViewport,
+            projectionMatrix: projection,
+            viewMatrix: viewMatrix,
+            screenSize: SIMD2(x: Int(width), y: Int(height))
+        )
+    }
+
+    private func updateRotation() {
+        let now = Date()
+        if autoRotates {
+            yaw += Float(now.timeIntervalSince(lastFrameDate)) * 0.22
+        }
+        lastFrameDate = now
+    }
+}
+
+private final class SimultaneousSplatGestureDelegate: NSObject, UIGestureRecognizerDelegate {
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }
 
@@ -93,8 +529,8 @@ private enum PointCloudSceneBuilder {
     }
 
     private static func makeGeometry(points: [PreviewPoint]) -> SCNGeometry {
-        var vertices = points.map { SCNVector3($0.x, $0.y, $0.z) }
-        var colors = points.flatMap { point in
+        let vertices = points.map { SCNVector3($0.x, $0.y, $0.z) }
+        let colors = points.flatMap { point in
             [
                 Float(point.r) / 255,
                 Float(point.g) / 255,
@@ -202,4 +638,50 @@ private struct PreviewPoint {
         self.g = g
         self.b = b
     }
+}
+
+private func matrix4x4Rotation(radians: Float, axis: SIMD3<Float>) -> simd_float4x4 {
+    let unitAxis = normalize(axis)
+    let ct = cosf(radians)
+    let st = sinf(radians)
+    let ci = 1 - ct
+    let x = unitAxis.x
+    let y = unitAxis.y
+    let z = unitAxis.z
+    return simd_float4x4(columns: (
+        SIMD4<Float>(ct + x * x * ci, y * x * ci + z * st, z * x * ci - y * st, 0),
+        SIMD4<Float>(x * y * ci - z * st, ct + y * y * ci, z * y * ci + x * st, 0),
+        SIMD4<Float>(x * z * ci + y * st, y * z * ci - x * st, ct + z * z * ci, 0),
+        SIMD4<Float>(0, 0, 0, 1)
+    ))
+}
+
+private func matrix4x4Translation(_ x: Float, _ y: Float, _ z: Float) -> simd_float4x4 {
+    simd_float4x4(columns: (
+        SIMD4<Float>(1, 0, 0, 0),
+        SIMD4<Float>(0, 1, 0, 0),
+        SIMD4<Float>(0, 0, 1, 0),
+        SIMD4<Float>(x, y, z, 1)
+    ))
+}
+
+private func matrixPerspectiveRightHand(
+    fovyRadians fovy: Float,
+    aspectRatio: Float,
+    nearZ: Float,
+    farZ: Float
+) -> simd_float4x4 {
+    let ys = 1 / tanf(fovy * 0.5)
+    let xs = ys / aspectRatio
+    let zs = farZ / (nearZ - farZ)
+    return simd_float4x4(columns: (
+        SIMD4<Float>(xs, 0, 0, 0),
+        SIMD4<Float>(0, ys, 0, 0),
+        SIMD4<Float>(0, 0, zs, -1),
+        SIMD4<Float>(0, 0, zs * nearZ, 0)
+    ))
+}
+
+private func clamp(_ value: Float, min minimum: Float, max maximum: Float) -> Float {
+    Swift.min(Swift.max(value, minimum), maximum)
 }
