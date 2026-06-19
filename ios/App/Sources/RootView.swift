@@ -4,6 +4,7 @@ struct RootView: View {
     @State private var scans = MemoScan.sampleData
     @State private var scanPendingDeletion: MemoScan?
     @State private var isCapturing = false
+    @State private var capturedPreview: CaptureSessionPackage?
 
     private let columns = [
         GridItem(.adaptive(minimum: 158, maximum: 240), spacing: 10)
@@ -58,11 +59,16 @@ struct RootView: View {
                 Text("\(scan.title) will be removed from this device.")
             }
             .fullScreenCover(isPresented: $isCapturing) {
-                CaptureView { exportedURL, frameCount in
-                    addCapturedScan(packageURL: exportedURL, frameCount: frameCount)
+                CaptureView { package in
+                    addCapturedScan(package: package)
+                    capturedPreview = package
+                    isCapturing = false
                 }
                 .ignoresSafeArea()
                 .statusBarHidden(true)
+            }
+            .navigationDestination(item: $capturedPreview) { package in
+                PointCloudPreviewView(package: package)
             }
         }
     }
@@ -85,10 +91,10 @@ struct RootView: View {
         }
     }
 
-    private func addCapturedScan(packageURL: URL, frameCount: Int) {
+    private func addCapturedScan(package: CaptureSessionPackage) {
         let newScan = MemoScan(
-            title: packageURL.deletingPathExtension().lastPathComponent,
-            subtitle: "\(frameCount) frames",
+            title: package.rootURL.lastPathComponent,
+            subtitle: "\(package.keyframeCount) frames",
             symbolName: "camera.viewfinder",
             colors: [.memoMint, .memoBlue]
         )

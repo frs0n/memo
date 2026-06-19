@@ -10,12 +10,14 @@ struct CaptureIngestResult {
     var statusText: String
 }
 
-struct CaptureExportPackage {
-    var url: URL
+struct CaptureSessionPackage: Hashable {
+    var rootURL: URL
+    var pointCloudURL: URL
     var keyframeCount: Int
+    var pointCount: Int
 }
 
-final class GSScanExporter {
+final class GSScanRecorder {
     private let fileManager = FileManager.default
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let jpegColorSpace = CGColorSpaceCreateDeviceRGB()
@@ -105,9 +107,9 @@ final class GSScanExporter {
         return CaptureIngestResult(didAcceptKeyframe: true, statusText: "Recording")
     }
 
-    func finish() throws -> CaptureExportPackage {
+    func finish() throws -> CaptureSessionPackage {
         guard let rootURL, let sparseURL, let depthURL else {
-            throw CaptureExportError.noActiveCapture
+            throw CaptureSessionError.noActiveCapture
         }
 
         try framesLog?.close()
@@ -115,17 +117,16 @@ final class GSScanExporter {
 
         try camerasText.write(to: sparseURL.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
         try imagesText.write(to: sparseURL.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
-        try writePLY(to: depthURL.appendingPathComponent("fused_points.ply"))
+        let pointCloudURL = depthURL.appendingPathComponent("fused_points.ply")
+        try writePLY(to: pointCloudURL)
         try writeManifest(to: rootURL.appendingPathComponent("capture.json"))
 
-        let zipURL = rootURL.deletingLastPathComponent()
-            .appendingPathComponent(rootURL.lastPathComponent)
-            .appendingPathExtension("zip")
-        if fileManager.fileExists(atPath: zipURL.path) {
-            try fileManager.removeItem(at: zipURL)
-        }
-        try ZipStoreWriter.zipDirectory(rootURL, to: zipURL)
-        return CaptureExportPackage(url: zipURL, keyframeCount: keyframeCount)
+        return CaptureSessionPackage(
+            rootURL: rootURL,
+            pointCloudURL: pointCloudURL,
+            keyframeCount: keyframeCount,
+            pointCount: points.count
+        )
     }
 
     private func writeKeyframe(_ frame: ARFrame, sharpness: Double) -> Bool {
@@ -414,7 +415,7 @@ private struct CaptureQualityGates: Encodable {
     var maximumDepthMeters: Float
 }
 
-private enum CaptureExportError: Error {
+private enum CaptureSessionError: Error {
     case noActiveCapture
 }
 

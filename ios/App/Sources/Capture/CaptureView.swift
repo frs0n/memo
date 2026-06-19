@@ -3,10 +3,10 @@ import SwiftUI
 import UIKit
 
 struct CaptureView: UIViewControllerRepresentable {
-    var onExported: (URL, Int) -> Void
+    var onCaptured: (CaptureSessionPackage) -> Void
 
     func makeUIViewController(context: Context) -> CaptureViewController {
-        CaptureViewController(onExported: onExported)
+        CaptureViewController(onCaptured: onCaptured)
     }
 
     func updateUIViewController(_ uiViewController: CaptureViewController, context: Context) {}
@@ -17,15 +17,15 @@ final class CaptureViewController: UIViewController {
     private let coachingOverlay = ARCoachingOverlayView()
     private let recordButton = CameraRecordButton()
     private let closeButton = UIButton(type: .system)
-    private let exporter = GSScanExporter()
+    private let recorder = GSScanRecorder()
     private let haptics = UIImpactFeedbackGenerator(style: .light)
-    private let onExported: (URL, Int) -> Void
+    private let onCaptured: (CaptureSessionPackage) -> Void
 
     private var isRecording = false
     private var isFinishing = false
 
-    init(onExported: @escaping (URL, Int) -> Void) {
-        self.onExported = onExported
+    init(onCaptured: @escaping (CaptureSessionPackage) -> Void) {
+        self.onCaptured = onCaptured
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
         modalPresentationCapturesStatusBarAppearance = true
@@ -188,7 +188,7 @@ final class CaptureViewController: UIViewController {
 
     private func beginCapture() {
         do {
-            try exporter.begin()
+            try recorder.begin()
             isRecording = true
             haptics.prepare()
             recordButton.accessibilityLabel = "Stop recording"
@@ -206,27 +206,14 @@ final class CaptureViewController: UIViewController {
         recordButton.setRecording(false, animated: true)
 
         do {
-            let package = try exporter.finish()
+            let package = try recorder.finish()
             isFinishing = false
-            onExported(package.url, package.keyframeCount)
-            presentShareSheet(for: package.url)
+            onCaptured(package)
         } catch {
             isFinishing = false
             recordButton.isEnabled = true
             recordButton.setRecording(true, animated: true)
         }
-    }
-
-    private func presentShareSheet(for url: URL) {
-        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-        activity.completionWithItemsHandler = { [weak self] _, _, _, _ in
-            self?.dismiss(animated: true)
-        }
-        if let popover = activity.popoverPresentationController {
-            popover.sourceView = recordButton
-            popover.sourceRect = recordButton.bounds
-        }
-        present(activity, animated: true)
     }
 }
 
@@ -293,7 +280,7 @@ extension CaptureViewController: @preconcurrency ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isRecording, !isFinishing else { return }
 
-        let result = exporter.ingest(frame: frame)
+        let result = recorder.ingest(frame: frame)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if result.didAcceptKeyframe {

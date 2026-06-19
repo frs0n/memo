@@ -30,6 +30,11 @@ settingGroups:
     ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     SWIFT_EMIT_LOC_STRINGS: YES
 
+packages:
+  MetalSplatter:
+    url: https://github.com/scier/MetalSplatter.git
+    from: 1.0.1
+
 targets:
   memo:
     type: application
@@ -43,3 +48,6 @@ targets:
         SUPPORTS_MACCATALYST: NO
     sources:
       - path: App
+    dependencies:
+      - package: MetalSplatter
+        product: MetalSplatter
