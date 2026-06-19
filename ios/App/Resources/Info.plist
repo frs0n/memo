@@ -20,6 +20,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>memo uses the iPhone camera and ARKit to capture RGB keyframes, camera poses, intrinsics, and LiDAR depth for local 3D Gaussian Splatting reconstruction.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -31,6 +33,7 @@
 	<array>
 		<string>arm64</string>
 		<string>metal</string>
+		<string>arkit</string>
 	</array>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>

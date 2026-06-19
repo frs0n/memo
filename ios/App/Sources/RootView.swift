@@ -3,6 +3,7 @@ import SwiftUI
 struct RootView: View {
     @State private var scans = MemoScan.sampleData
     @State private var scanPendingDeletion: MemoScan?
+    @State private var isCapturing = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 158, maximum: 240), spacing: 10)
@@ -37,7 +38,7 @@ struct RootView: View {
                 .scrollIndicators(.hidden)
 
                 AddScanButton {
-                    addPlaceholderScan()
+                    isCapturing = true
                 }
                 .padding(.bottom, 18)
             }
@@ -55,6 +56,13 @@ struct RootView: View {
                 }
             } message: { scan in
                 Text("\(scan.title) will be removed from this device.")
+            }
+            .fullScreenCover(isPresented: $isCapturing) {
+                CaptureView { exportedURL, frameCount in
+                    addCapturedScan(packageURL: exportedURL, frameCount: frameCount)
+                }
+                .ignoresSafeArea()
+                .statusBarHidden(true)
             }
         }
     }
@@ -77,10 +85,10 @@ struct RootView: View {
         }
     }
 
-    private func addPlaceholderScan() {
+    private func addCapturedScan(packageURL: URL, frameCount: Int) {
         let newScan = MemoScan(
-            title: "New memory",
-            subtitle: "capturing",
+            title: packageURL.deletingPathExtension().lastPathComponent,
+            subtitle: "\(frameCount) frames",
             symbolName: "camera.viewfinder",
             colors: [.memoMint, .memoBlue]
         )
