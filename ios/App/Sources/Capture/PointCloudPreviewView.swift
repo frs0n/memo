@@ -9,6 +9,8 @@ import UIKit
 import simd
 
 struct PointCloudPreviewView: View {
+    @Environment(\.dismiss) private var dismiss
+
     let package: CaptureSessionPackage
 
     @StateObject private var trainer = ScanTrainingController()
@@ -39,6 +41,18 @@ struct PointCloudPreviewView: View {
         }
         .navigationTitle(trainer.navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.headline)
+                }
+                .accessibilityLabel("Back")
+            }
+        }
         .onDisappear {
             trainer.cancel()
         }
