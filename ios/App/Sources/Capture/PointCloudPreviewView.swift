@@ -10,7 +10,7 @@ struct PointCloudPreviewView: View {
 
     var body: some View {
         ZStack {
-            Color.black
+            Color(.systemBackground)
                 .ignoresSafeArea()
 
             PointCloudSceneView(pointCloudURL: package.pointCloudURL)
@@ -22,12 +22,8 @@ struct PointCloudPreviewView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
         }
-        .navigationTitle("")
+        .navigationTitle("Train")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .toolbarColorScheme(.dark, for: .navigationBar)
-        .tint(.white)
-        .preferredColorScheme(.dark)
     }
 }
 
@@ -38,9 +34,8 @@ private struct TrainButton: View {
         if #available(iOS 26.0, *) {
             Button("Train", action: action)
                 .font(.headline)
-                .foregroundStyle(.black)
                 .frame(maxWidth: .infinity, minHeight: 54)
-                .buttonStyle(.glassProminent)
+                .buttonStyle(.glass)
                 .controlSize(.large)
                 .accessibilityLabel("Train")
         } else {
@@ -49,8 +44,6 @@ private struct TrainButton: View {
                 .frame(maxWidth: .infinity, minHeight: 54)
                 .buttonStyle(.borderedProminent)
                 .buttonBorderShape(.capsule)
-                .tint(.white)
-                .foregroundStyle(.black)
                 .controlSize(.large)
                 .accessibilityLabel("Train")
         }
@@ -62,7 +55,7 @@ private struct PointCloudSceneView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> SCNView {
         let view = SCNView(frame: .zero)
-        view.backgroundColor = .black
+        view.backgroundColor = .systemBackground
         view.allowsCameraControl = true
         view.autoenablesDefaultLighting = false
         view.scene = PointCloudSceneBuilder.scene(from: pointCloudURL)
