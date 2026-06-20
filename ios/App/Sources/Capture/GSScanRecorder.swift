@@ -23,7 +23,12 @@ final class GSScanRecorder {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let jpegColorSpace = CGColorSpaceCreateDeviceRGB()
     private let minimumDisplacement: Float = 0.05
+    private let minimumAngularChange: Float = .pi / 18
     private let minimumSharpness: Double = 7.5
+    private let minimumDepthCoverage: Double = 0.16
+    private let minimumHighConfidenceDepthRatio: Double = 0.28
+    private let maximumMotionSpeed: Float = 0.75
+    private let candidateWindowSize = 8
     private let depthSampleStride = 3
     private let maximumPointCount = 700_000
 
@@ -35,7 +40,11 @@ final class GSScanRecorder {
     private var camerasText = "# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
     private var imagesText = "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n# POINTS2D[] as X, Y, POINT3D_ID\n"
     private var points: [PLYPoint] = []
+    private var candidateWindow: [KeyframeCandidate] = []
     private var lastKeyframePosition: SIMD3<Float>?
+    private var lastKeyframeTransform: simd_float4x4?
+    private var lastFramePosition: SIMD3<Float>?
+    private var lastFrameTimestamp: TimeInterval?
     private var frameIndex = 0
     private(set) var keyframeCount = 0
 
@@ -69,7 +78,11 @@ final class GSScanRecorder {
         camerasText = "# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
         imagesText = "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n# POINTS2D[] as X, Y, POINT3D_ID\n"
         points.removeAll(keepingCapacity: true)
+        candidateWindow.removeAll(keepingCapacity: true)
         lastKeyframePosition = nil
+        lastKeyframeTransform = nil
+        lastFramePosition = nil
+        lastFrameTimestamp = nil
         frameIndex = 0
         keyframeCount = 0
     }
@@ -80,38 +93,71 @@ final class GSScanRecorder {
         }
 
         frameIndex += 1
-        appendFrameMetadata(frame)
+        let currentFrameIndex = frameIndex
+        let currentPosition = frame.camera.transform.translation
+        defer {
+            lastFramePosition = currentPosition
+            lastFrameTimestamp = frame.timestamp
+        }
 
         guard frame.camera.trackingState.isNormal else {
+            appendFrameMetadata(frame, quality: nil)
             return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Tracking")
         }
 
-        let currentPosition = frame.camera.transform.translation
+        let quality = measureFrameQuality(frame)
+        appendFrameMetadata(frame, quality: quality)
+
+        guard quality.motionSpeed <= maximumMotionSpeed else {
+            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Slow down")
+        }
+
+        guard quality.lumaMean > 0.08 && quality.lumaMean < 0.92 else {
+            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Adjust lighting")
+        }
+
+        guard abs(quality.exposureOffset) < 1.8 else {
+            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Hold exposure")
+        }
+
+        guard quality.sharpness >= minimumSharpness else {
+            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Too blurry")
+        }
+
+        guard quality.depthCoverage >= minimumDepthCoverage,
+              quality.highConfidenceDepthRatio >= minimumHighConfidenceDepthRatio else {
+            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Find depth")
+        }
+
         if let lastKeyframePosition {
-            let displacement = simd_distance(currentPosition, lastKeyframePosition)
-            guard displacement >= minimumDisplacement else {
+            let hasTranslation = quality.displacement >= minimumDisplacement
+            let hasViewChange = quality.angularChange >= minimumAngularChange
+            guard hasTranslation || hasViewChange else {
                 return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Move for parallax")
             }
         }
 
-        let sharpness = Self.gradientSharpness(frame.capturedImage)
-        guard sharpness >= minimumSharpness else {
-            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Too blurry")
+        guard let candidate = makeCandidate(from: frame, frameIndex: currentFrameIndex, quality: quality) else {
+            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Selecting")
         }
 
-        guard writeKeyframe(frame, sharpness: sharpness) else {
-            return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Saving")
+        candidateWindow.append(candidate)
+        if candidateWindow.count >= candidateWindowSize {
+            guard commitBestCandidate() else {
+                return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Saving")
+            }
+            return CaptureIngestResult(didAcceptKeyframe: true, statusText: "Recording")
         }
 
-        lastKeyframePosition = currentPosition
-        fuseDepthPoints(from: frame)
-        return CaptureIngestResult(didAcceptKeyframe: true, statusText: "Recording")
+        return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Selecting")
     }
 
     func finish() throws -> CaptureSessionPackage {
         guard let rootURL, let sparseURL, let depthURL else {
             throw CaptureSessionError.noActiveCapture
         }
+
+        _ = commitBestCandidate()
 
         try framesLog?.close()
         framesLog = nil
@@ -131,65 +177,99 @@ final class GSScanRecorder {
         )
     }
 
-    private func writeKeyframe(_ frame: ARFrame, sharpness: Double) -> Bool {
+    private func makeCandidate(from frame: ARFrame, frameIndex: Int, quality: FrameQuality) -> KeyframeCandidate? {
+        guard let jpeg = jpegData(from: frame.capturedImage) else { return nil }
+
+        let depthSample = sampleDepthPoints(from: frame)
+        guard !depthSample.points.isEmpty else { return nil }
+
+        let thumbnail = keyframeCount == 0 ? thumbnailData(from: frame.capturedImage) : nil
+        return KeyframeCandidate(
+            frameIndex: frameIndex,
+            timestamp: frame.timestamp,
+            resolution: [
+                CVPixelBufferGetWidth(frame.capturedImage),
+                CVPixelBufferGetHeight(frame.capturedImage)
+            ],
+            intrinsics: frame.camera.intrinsics,
+            transform: frame.camera.transform,
+            jpegData: jpeg,
+            thumbnailData: thumbnail,
+            depthPoints: depthSample.points,
+            quality: quality.withDepthStats(depthSample.stats)
+        )
+    }
+
+    private func commitBestCandidate() -> Bool {
+        guard let bestIndex = candidateWindow.indices.max(by: {
+            candidateWindow[$0].quality.score < candidateWindow[$1].quality.score
+        }) else {
+            return false
+        }
+
+        let candidate = candidateWindow[bestIndex]
+        candidateWindow.removeAll(keepingCapacity: true)
+
+        guard writeKeyframe(candidate) else { return false }
+        appendDepthPoints(candidate.depthPoints)
+        lastKeyframePosition = candidate.transform.translation
+        lastKeyframeTransform = candidate.transform
+        return true
+    }
+
+    private func writeKeyframe(_ candidate: KeyframeCandidate) -> Bool {
         guard let imagesURL else { return false }
 
         let imageName = String(format: "frame_%06d.jpg", keyframeCount + 1)
         let imageURL = imagesURL.appendingPathComponent(imageName)
-        let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
-
-        guard let jpeg = ciContext.jpegRepresentation(
-            of: ciImage,
-            colorSpace: jpegColorSpace,
-            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.94]
-        ) else {
-            return false
-        }
 
         do {
-            try jpeg.write(to: imageURL, options: .atomic)
-            if keyframeCount == 0, let rootURL {
-                try writeThumbnail(from: frame.capturedImage, to: rootURL.appendingPathComponent("thumbnail.jpg"))
+            try candidate.jpegData.write(to: imageURL, options: .atomic)
+            if keyframeCount == 0, let rootURL, let thumbnailData = candidate.thumbnailData {
+                try thumbnailData.write(to: rootURL.appendingPathComponent("thumbnail.jpg"), options: .atomic)
             }
             keyframeCount += 1
 
-            let imageSize = CGSize(width: CVPixelBufferGetWidth(frame.capturedImage), height: CVPixelBufferGetHeight(frame.capturedImage))
-            let intrinsics = frame.camera.intrinsics
+            let intrinsics = candidate.intrinsics
             let cameraID = keyframeCount
-            camerasText += "\(cameraID) PINHOLE \(Int(imageSize.width)) \(Int(imageSize.height)) \(intrinsics[0, 0]) \(intrinsics[1, 1]) \(intrinsics[2, 0]) \(intrinsics[2, 1])\n"
+            camerasText += "\(cameraID) PINHOLE \(candidate.resolution[0]) \(candidate.resolution[1]) \(intrinsics[0, 0]) \(intrinsics[1, 1]) \(intrinsics[2, 0]) \(intrinsics[2, 1])\n"
 
-            let worldToCamera = frame.camera.transform.inverse
+            let worldToCamera = candidate.transform.inverse
             let q = Quaternion(matrix: worldToCamera.rotationMatrix)
             let t = worldToCamera.translation
             imagesText += "\(keyframeCount) \(q.w) \(q.x) \(q.y) \(q.z) \(t.x) \(t.y) \(t.z) \(cameraID) \(imageName)\n\n"
 
-            appendAcceptedMetadata(frame, imageName: imageName, sharpness: sharpness)
+            appendAcceptedMetadata(candidate, imageName: imageName)
             return true
         } catch {
             return false
         }
     }
 
-    private func writeThumbnail(from pixelBuffer: CVPixelBuffer, to url: URL) throws {
+    private func jpegData(from pixelBuffer: CVPixelBuffer) -> Data? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        return ciContext.jpegRepresentation(
+            of: ciImage,
+            colorSpace: jpegColorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.94]
+        )
+    }
+
+    private func thumbnailData(from pixelBuffer: CVPixelBuffer) -> Data? {
         let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(Self.thumbnailOrientation())
         let extent = source.extent
         let maximumSide: CGFloat = 900
         let scale = min(maximumSide / max(extent.width, extent.height), 1)
         let resized = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
-        guard let cgImage = ciContext.createCGImage(resized, from: resized.extent) else {
-            throw CaptureSessionError.thumbnailFailed
-        }
+        guard let cgImage = ciContext.createCGImage(resized, from: resized.extent) else { return nil }
 
         let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
         let renderer = UIGraphicsImageRenderer(size: size)
         let image = renderer.image { _ in
             UIImage(cgImage: cgImage).draw(in: CGRect(origin: .zero, size: size))
         }
-        guard let data = image.jpegData(compressionQuality: 0.82) else {
-            throw CaptureSessionError.thumbnailFailed
-        }
-        try data.write(to: url, options: .atomic)
+        return image.jpegData(compressionQuality: 0.82)
     }
 
     private static func thumbnailOrientation() -> CGImagePropertyOrientation {
@@ -205,7 +285,7 @@ final class GSScanRecorder {
         }
     }
 
-    private func appendFrameMetadata(_ frame: ARFrame) {
+    private func appendFrameMetadata(_ frame: ARFrame, quality: FrameQuality?) {
         let payload = FrameMetadata(
             index: frameIndex,
             timestamp: frame.timestamp,
@@ -218,25 +298,38 @@ final class GSScanRecorder {
             ],
             intrinsics: frame.camera.intrinsics.array,
             transform: frame.camera.transform.array,
-            sharpness: nil
+            sharpness: quality?.sharpness,
+            depthCoverage: quality?.depthCoverage,
+            highConfidenceDepthRatio: quality?.highConfidenceDepthRatio,
+            exposureOffset: quality?.exposureOffset,
+            lumaMean: quality?.lumaMean,
+            motionSpeed: quality?.motionSpeed,
+            displacement: quality?.displacement,
+            angularChange: quality?.angularChange,
+            qualityScore: quality?.score
         )
         appendJSONLine(payload)
     }
 
-    private func appendAcceptedMetadata(_ frame: ARFrame, imageName: String, sharpness: Double) {
+    private func appendAcceptedMetadata(_ candidate: KeyframeCandidate, imageName: String) {
         let payload = FrameMetadata(
-            index: frameIndex,
-            timestamp: frame.timestamp,
+            index: candidate.frameIndex,
+            timestamp: candidate.timestamp,
             acceptedKeyframe: true,
             imageName: imageName,
-            trackingState: frame.camera.trackingState.description,
-            resolution: [
-                CVPixelBufferGetWidth(frame.capturedImage),
-                CVPixelBufferGetHeight(frame.capturedImage)
-            ],
-            intrinsics: frame.camera.intrinsics.array,
-            transform: frame.camera.transform.array,
-            sharpness: sharpness
+            trackingState: "normal",
+            resolution: candidate.resolution,
+            intrinsics: candidate.intrinsics.array,
+            transform: candidate.transform.array,
+            sharpness: candidate.quality.sharpness,
+            depthCoverage: candidate.quality.depthCoverage,
+            highConfidenceDepthRatio: candidate.quality.highConfidenceDepthRatio,
+            exposureOffset: candidate.quality.exposureOffset,
+            lumaMean: candidate.quality.lumaMean,
+            motionSpeed: candidate.quality.motionSpeed,
+            displacement: candidate.quality.displacement,
+            angularChange: candidate.quality.angularChange,
+            qualityScore: candidate.quality.score
         )
         appendJSONLine(payload)
     }
@@ -250,9 +343,95 @@ final class GSScanRecorder {
         try? framesLog?.write(contentsOf: newline)
     }
 
-    private func fuseDepthPoints(from frame: ARFrame) {
+    private func appendDepthPoints(_ newPoints: [PLYPoint]) {
         guard points.count < maximumPointCount else { return }
-        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return }
+        let remaining = maximumPointCount - points.count
+        points.append(contentsOf: newPoints.prefix(remaining))
+    }
+
+    private func measureFrameQuality(_ frame: ARFrame) -> FrameQuality {
+        let sharpness = Self.gradientSharpness(frame.capturedImage)
+        let luma = Self.lumaStats(frame.capturedImage)
+        let depthStats = measureDepthStats(from: frame, stride: depthSampleStride * 2)
+        let position = frame.camera.transform.translation
+        let timestamp = frame.timestamp
+        let motionSpeed: Float
+        if let lastFramePosition, let lastFrameTimestamp {
+            let dt = max(Float(timestamp - lastFrameTimestamp), 0.001)
+            motionSpeed = simd_distance(position, lastFramePosition) / dt
+        } else {
+            motionSpeed = 0
+        }
+
+        let displacement = lastKeyframePosition.map { simd_distance(position, $0) } ?? 0
+        let angularChange = lastKeyframeTransform.map { Self.viewAngle(from: $0, to: frame.camera.transform) } ?? 0
+
+        return FrameQuality(
+            sharpness: sharpness,
+            depthCoverage: depthStats.coverage,
+            highConfidenceDepthRatio: depthStats.highConfidenceRatio,
+            exposureOffset: frame.camera.exposureOffset,
+            lumaMean: luma.mean,
+            lumaVariance: luma.variance,
+            motionSpeed: motionSpeed,
+            displacement: displacement,
+            angularChange: angularChange
+        )
+    }
+
+    private func measureDepthStats(from frame: ARFrame, stride sampleStride: Int) -> DepthStats {
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return .empty }
+
+        let depthMap = depthData.depthMap
+        let confidenceMap = depthData.confidenceMap
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        if let confidenceMap {
+            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+        }
+        defer {
+            if let confidenceMap {
+                CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+            }
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+        }
+
+        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self) else {
+            return .empty
+        }
+
+        let depthWidth = CVPixelBufferGetWidth(depthMap)
+        let depthHeight = CVPixelBufferGetHeight(depthMap)
+        let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+        let confidenceBase = confidenceMap.flatMap { CVPixelBufferGetBaseAddress($0)?.assumingMemoryBound(to: UInt8.self) }
+        let confidenceStride = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+        var totalSamples = 0
+        var validSamples = 0
+        var highConfidenceSamples = 0
+
+        for y in stride(from: 0, to: depthHeight, by: sampleStride) {
+            for x in stride(from: 0, to: depthWidth, by: sampleStride) {
+                totalSamples += 1
+                let confidence = confidenceBase.map { $0[y * confidenceStride + x] } ?? 2
+                if confidence < 1 { continue }
+
+                let depth = depthBase[y * depthStride + x]
+                if !depth.isFinite || depth <= 0.05 || depth > 8.0 { continue }
+
+                validSamples += 1
+                if confidence >= 2 {
+                    highConfidenceSamples += 1
+                }
+            }
+        }
+
+        return DepthStats(
+            coverage: totalSamples == 0 ? 0 : Double(validSamples) / Double(totalSamples),
+            highConfidenceRatio: validSamples == 0 ? 0 : Double(highConfidenceSamples) / Double(validSamples)
+        )
+    }
+
+    private func sampleDepthPoints(from frame: ARFrame) -> DepthSample {
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return .empty }
 
         let depthMap = depthData.depthMap
         let confidenceMap = depthData.confidenceMap
@@ -269,7 +448,9 @@ final class GSScanRecorder {
             CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
         }
 
-        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self) else { return }
+        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap)?.assumingMemoryBound(to: Float32.self) else {
+            return .empty
+        }
         let depthWidth = CVPixelBufferGetWidth(depthMap)
         let depthHeight = CVPixelBufferGetHeight(depthMap)
         let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
@@ -286,17 +467,24 @@ final class GSScanRecorder {
         let cx = intrinsics[2, 0] * scaleX
         let cy = intrinsics[2, 1] * scaleY
         let cameraToWorld = frame.camera.transform
+        var sampledPoints: [PLYPoint] = []
+        sampledPoints.reserveCapacity((depthWidth / depthSampleStride) * (depthHeight / depthSampleStride))
+        var totalSamples = 0
+        var validSamples = 0
+        var highConfidenceSamples = 0
 
         for y in stride(from: 0, to: depthHeight, by: depthSampleStride) {
             for x in stride(from: 0, to: depthWidth, by: depthSampleStride) {
-                if points.count >= maximumPointCount { return }
-                if let confidenceBase {
-                    let confidence = confidenceBase[y * confidenceStride + x]
-                    if confidence < 1 { continue }
-                }
+                totalSamples += 1
+                let confidence = confidenceBase.map { $0[y * confidenceStride + x] } ?? 2
+                if confidence < 1 { continue }
 
                 let depth = depthBase[y * depthStride + x]
                 if !depth.isFinite || depth <= 0.05 || depth > 8.0 { continue }
+                validSamples += 1
+                if confidence >= 2 {
+                    highConfidenceSamples += 1
+                }
 
                 let cameraPoint = SIMD4<Float>(
                     (Float(x) - cx) * depth / fx,
@@ -306,9 +494,15 @@ final class GSScanRecorder {
                 )
                 let worldPoint = cameraToWorld * cameraPoint
                 let color = Self.sampleColor(frame.capturedImage, imageX: x * imageWidth / depthWidth, imageY: y * imageHeight / depthHeight)
-                points.append(PLYPoint(x: worldPoint.x, y: worldPoint.y, z: worldPoint.z, r: color.r, g: color.g, b: color.b))
+                sampledPoints.append(PLYPoint(x: worldPoint.x, y: worldPoint.y, z: worldPoint.z, r: color.r, g: color.g, b: color.b))
             }
         }
+
+        let stats = DepthStats(
+            coverage: totalSamples == 0 ? 0 : Double(validSamples) / Double(totalSamples),
+            highConfidenceRatio: validSamples == 0 ? 0 : Double(highConfidenceSamples) / Double(validSamples)
+        )
+        return DepthSample(points: sampledPoints, stats: stats)
     }
 
     private func writePLY(to url: URL) throws {
@@ -341,7 +535,12 @@ final class GSScanRecorder {
             qualityGates: CaptureQualityGates(
                 tracking: "ARCamera.TrackingState.normal",
                 minimumDisplacementMeters: minimumDisplacement,
+                minimumAngularChangeRadians: minimumAngularChange,
                 minimumSharpness: minimumSharpness,
+                minimumDepthCoverage: minimumDepthCoverage,
+                minimumHighConfidenceDepthRatio: minimumHighConfidenceDepthRatio,
+                maximumMotionSpeedMetersPerSecond: maximumMotionSpeed,
+                candidateWindowSize: candidateWindowSize,
                 lidarConfidence: "medium-or-high",
                 maximumDepthMeters: 8
             ),
@@ -382,6 +581,43 @@ final class GSScanRecorder {
             }
         }
         return samples == 0 ? 0 : Double(sum) / Double(samples)
+    }
+
+    private static func lumaStats(_ pixelBuffer: CVPixelBuffer) -> (mean: Double, variance: Double) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let plane = CVPixelBufferIsPlanar(pixelBuffer) ? 0 : 0
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane)?.assumingMemoryBound(to: UInt8.self) else {
+            return (0.5, 0)
+        }
+
+        let sampleStride = 16
+        var sum = 0.0
+        var sumSquares = 0.0
+        var samples = 0.0
+        for y in stride(from: sampleStride, to: height - sampleStride, by: sampleStride) {
+            for x in stride(from: sampleStride, to: width - sampleStride, by: sampleStride) {
+                let value = Double(base[y * rowBytes + x]) / 255.0
+                sum += value
+                sumSquares += value * value
+                samples += 1
+            }
+        }
+
+        guard samples > 0 else { return (0.5, 0) }
+        let mean = sum / samples
+        return (mean, max(sumSquares / samples - mean * mean, 0))
+    }
+
+    private static func viewAngle(from lhs: simd_float4x4, to rhs: simd_float4x4) -> Float {
+        let lhsForward = simd_normalize(-SIMD3<Float>(lhs.columns.2.x, lhs.columns.2.y, lhs.columns.2.z))
+        let rhsForward = simd_normalize(-SIMD3<Float>(rhs.columns.2.x, rhs.columns.2.y, rhs.columns.2.z))
+        let dot = min(max(simd_dot(lhsForward, rhsForward), -1), 1)
+        return acos(dot)
     }
 
     private static func sampleColor(_ pixelBuffer: CVPixelBuffer, imageX: Int, imageY: Int) -> (r: UInt8, g: UInt8, b: UInt8) {
@@ -425,6 +661,75 @@ private struct PLYPoint {
     var b: UInt8
 }
 
+private struct DepthStats {
+    var coverage: Double
+    var highConfidenceRatio: Double
+
+    static let empty = DepthStats(coverage: 0, highConfidenceRatio: 0)
+}
+
+private struct DepthSample {
+    var points: [PLYPoint]
+    var stats: DepthStats
+
+    static let empty = DepthSample(points: [], stats: .empty)
+}
+
+private struct FrameQuality {
+    var sharpness: Double
+    var depthCoverage: Double
+    var highConfidenceDepthRatio: Double
+    var exposureOffset: Float
+    var lumaMean: Double
+    var lumaVariance: Double
+    var motionSpeed: Float
+    var displacement: Float
+    var angularChange: Float
+
+    var score: Double {
+        let sharpnessScore = Self.saturate((sharpness - 7.5) / 22.0)
+        let depthScore = Self.saturate(depthCoverage / 0.45)
+        let confidenceScore = Self.saturate(highConfidenceDepthRatio / 0.75)
+        let baselineScore = max(Self.saturate(Double(displacement / 0.14)), Self.saturate(Double(angularChange / (.pi / 9))))
+        let exposureScore = Self.saturate(1.0 - Double(abs(exposureOffset)) / 1.8)
+        let brightnessScore = Self.saturate(1.0 - abs(lumaMean - 0.48) / 0.42)
+        let textureScore = Self.saturate(lumaVariance / 0.035)
+        let motionPenalty = Self.saturate(Double(motionSpeed / 0.75))
+
+        return sharpnessScore * 0.24 +
+            depthScore * 0.22 +
+            confidenceScore * 0.16 +
+            baselineScore * 0.15 +
+            exposureScore * 0.10 +
+            brightnessScore * 0.08 +
+            textureScore * 0.05 -
+            motionPenalty * 0.20
+    }
+
+    func withDepthStats(_ stats: DepthStats) -> FrameQuality {
+        var copy = self
+        copy.depthCoverage = stats.coverage
+        copy.highConfidenceDepthRatio = stats.highConfidenceRatio
+        return copy
+    }
+
+    private static func saturate(_ value: Double) -> Double {
+        min(max(value, 0), 1)
+    }
+}
+
+private struct KeyframeCandidate {
+    var frameIndex: Int
+    var timestamp: TimeInterval
+    var resolution: [Int]
+    var intrinsics: simd_float3x3
+    var transform: simd_float4x4
+    var jpegData: Data
+    var thumbnailData: Data?
+    var depthPoints: [PLYPoint]
+    var quality: FrameQuality
+}
+
 private struct FrameMetadata: Encodable {
     var index: Int
     var timestamp: TimeInterval
@@ -435,6 +740,14 @@ private struct FrameMetadata: Encodable {
     var intrinsics: [Float]
     var transform: [Float]
     var sharpness: Double?
+    var depthCoverage: Double?
+    var highConfidenceDepthRatio: Double?
+    var exposureOffset: Float?
+    var lumaMean: Double?
+    var motionSpeed: Float?
+    var displacement: Float?
+    var angularChange: Float?
+    var qualityScore: Double?
 }
 
 private struct CaptureManifest: Encodable {
@@ -450,14 +763,18 @@ private struct CaptureManifest: Encodable {
 private struct CaptureQualityGates: Encodable {
     var tracking: String
     var minimumDisplacementMeters: Float
+    var minimumAngularChangeRadians: Float
     var minimumSharpness: Double
+    var minimumDepthCoverage: Double
+    var minimumHighConfidenceDepthRatio: Double
+    var maximumMotionSpeedMetersPerSecond: Float
+    var candidateWindowSize: Int
     var lidarConfidence: String
     var maximumDepthMeters: Float
 }
 
 private enum CaptureSessionError: Error {
     case noActiveCapture
-    case thumbnailFailed
 }
 
 private extension JSONEncoder {

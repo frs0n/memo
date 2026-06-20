@@ -17,6 +17,7 @@ final class CaptureViewController: UIViewController {
     private let coachingOverlay = ARCoachingOverlayView()
     private let recordButton = CameraRecordButton()
     private let closeButton = UIButton(type: .system)
+    private let statusLabel = CaptureStatusLabel()
     private let recorder = GSScanRecorder()
     private let haptics = UIImpactFeedbackGenerator(style: .light)
     private let onCaptured: (CaptureSessionPackage) -> Void
@@ -118,7 +119,18 @@ final class CaptureViewController: UIViewController {
         recordButton.accessibilityLabel = "Start recording"
         recordButton.addTarget(self, action: #selector(recordTapped), for: .touchUpInside)
 
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.textAlignment = .center
+        statusLabel.font = .preferredFont(forTextStyle: .callout)
+        statusLabel.adjustsFontForContentSizeCategory = true
+        statusLabel.textColor = .white
+        statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+        statusLabel.layer.cornerRadius = 16
+        statusLabel.layer.masksToBounds = true
+        statusLabel.alpha = 0
+
         view.addSubview(closeButton)
+        view.addSubview(statusLabel)
         view.addSubview(recordButton)
 
         NSLayoutConstraint.activate([
@@ -130,7 +142,12 @@ final class CaptureViewController: UIViewController {
             recordButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             recordButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -28),
             recordButton.widthAnchor.constraint(equalToConstant: 72),
-            recordButton.heightAnchor.constraint(equalToConstant: 72)
+            recordButton.heightAnchor.constraint(equalToConstant: 72),
+
+            statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            statusLabel.bottomAnchor.constraint(equalTo: recordButton.topAnchor, constant: -18),
+            statusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.78),
+            statusLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 32)
         ])
     }
 
@@ -193,6 +210,7 @@ final class CaptureViewController: UIViewController {
             haptics.prepare()
             recordButton.accessibilityLabel = "Stop recording"
             recordButton.setRecording(true, animated: true)
+            setCaptureStatus("Move slowly")
         } catch {
             recordButton.isEnabled = true
         }
@@ -204,16 +222,43 @@ final class CaptureViewController: UIViewController {
         isFinishing = true
         recordButton.isEnabled = false
         recordButton.setRecording(false, animated: true)
+        setCaptureStatus("Saving")
 
         do {
             let package = try recorder.finish()
             isFinishing = false
+            setCaptureStatus(nil)
             onCaptured(package)
         } catch {
             isFinishing = false
             recordButton.isEnabled = true
             recordButton.setRecording(true, animated: true)
+            setCaptureStatus("Try again")
         }
+    }
+
+    private func setCaptureStatus(_ text: String?) {
+        guard statusLabel.text != text else { return }
+        statusLabel.text = text
+        UIView.animate(withDuration: 0.16) {
+            self.statusLabel.alpha = text == nil ? 0 : 1
+        }
+    }
+}
+
+private final class CaptureStatusLabel: UILabel {
+    private let textInsets = UIEdgeInsets(top: 6, left: 14, bottom: 6, right: 14)
+
+    override func drawText(in rect: CGRect) {
+        super.drawText(in: rect.inset(by: textInsets))
+    }
+
+    override var intrinsicContentSize: CGSize {
+        let size = super.intrinsicContentSize
+        return CGSize(
+            width: size.width + textInsets.left + textInsets.right,
+            height: size.height + textInsets.top + textInsets.bottom
+        )
     }
 }
 
@@ -283,6 +328,7 @@ extension CaptureViewController: @preconcurrency ARSessionDelegate {
         let result = recorder.ingest(frame: frame)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.setCaptureStatus(result.statusText)
             if result.didAcceptKeyframe {
                 self.haptics.impactOccurred()
                 self.haptics.prepare()
