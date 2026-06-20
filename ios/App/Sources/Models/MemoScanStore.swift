@@ -32,10 +32,6 @@ extension MemoScanRecord {
         packageURL.appendingPathComponent("thumbnail.jpg")
     }
 
-    var splatURL: URL {
-        packageURL.appendingPathComponent("trained_2000.splat")
-    }
-
     var gaussianPlyURL: URL {
         packageURL.appendingPathComponent("trained_2000.ply")
     }
@@ -44,8 +40,8 @@ extension MemoScanRecord {
         packageURL.appendingPathComponent("scan.json")
     }
 
-    var canRenderSplat: Bool {
-        status == .trained && FileManager.default.fileExists(atPath: splatURL.path)
+    var canRenderGaussian: Bool {
+        status == .trained && FileManager.default.fileExists(atPath: gaussianPlyURL.path)
     }
 
     var hasGaussianPly: Bool {

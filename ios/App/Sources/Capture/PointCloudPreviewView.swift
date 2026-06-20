@@ -29,13 +29,20 @@ struct PointCloudPreviewView: View {
             Color(.systemBackground)
                 .ignoresSafeArea()
 
-            switch trainer.phase {
-            case .idle, .training, .failed:
-                PointCloudSceneView(pointCloudURL: scan.pointCloudURL)
-                    .ignoresSafeArea()
-            case .rendering(let splatURL):
-                GaussianSplatView(splatURL: splatURL)
-                    .ignoresSafeArea()
+            if let gaussianFileURL = trainer.previewGaussianFileURL {
+                GaussianSplatView(
+                    gaussianFileURL: gaussianFileURL,
+                    reloadToken: trainer.previewReloadToken
+                )
+                .ignoresSafeArea()
+            } else {
+                switch trainer.phase {
+                case .idle, .training, .failed:
+                    PointCloudSceneView(pointCloudURL: scan.pointCloudURL)
+                        .ignoresSafeArea()
+                case .rendering:
+                    EmptyView()
+                }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -120,16 +127,20 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     @Published var iteration = 0
     @Published var splatCount = 0
     @Published var errorMessage: String?
+    @Published var previewGaussianFileURL: URL?
+    @Published var previewReloadToken = 0
 
     let totalIterations = 4_500
     private let store: MemoScanStore
     private var task: Task<Void, Never>?
+    private let previewInterval = 1_000
 
     init(scan: MemoScanRecord, store: MemoScanStore) {
         self.store = store
         errorMessage = scan.errorMessage
-        if scan.canRenderSplat {
-            phase = .rendering(scan.splatURL)
+        if scan.canRenderGaussian {
+            phase = .rendering(scan.gaussianPlyURL)
+            previewGaussianFileURL = scan.gaussianPlyURL
         } else if scan.status == .failed {
             phase = .failed
         } else {
@@ -160,26 +171,33 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
 
         task?.cancel()
         phase = .training
-        iteration = 0
         splatCount = 0
         errorMessage = nil
-        store.markTrainingStarted(scan)
-
         let rootPath = scan.packageURL.path
-        let outputURL = scan.splatURL
+        let outputURL = scan.gaussianPlyURL
+        let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
         let totalIterations = totalIterations
+        let previewInterval = previewInterval
+
+        if !FileManager.default.fileExists(atPath: outputURL.path) {
+            previewGaussianFileURL = nil
+            previewReloadToken = 0
+        }
+        store.markTrainingStarted(scan)
 
         let controller = self
         task = Task.detached(priority: .userInitiated) { [controller] in
             do {
-                let splatURL = try await Self.train(
+                let gaussianFileURL = try await Self.train(
                     datasetPath: rootPath,
                     outputURL: outputURL,
-                    iterations: totalIterations
+                    checkpointURL: checkpointURL,
+                    iterations: totalIterations,
+                    previewInterval: previewInterval
                 ) { stats in
                     await controller.update(stats: stats)
                 }
-                await controller.complete(scan: scan, splatURL: splatURL)
+                await controller.complete(scan: scan, gaussianFileURL: gaussianFileURL)
             } catch is CancellationError {
             } catch {
                 await controller.fail(scan: scan, error)
@@ -198,13 +216,21 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     private func update(stats: TrainingProgressSnapshot) {
         iteration = stats.iteration
         splatCount = stats.splatCount
+        if stats.didRefreshPreview {
+            previewGaussianFileURL = stats.previewGaussianFileURL
+            previewReloadToken += 1
+        }
     }
 
-    private func complete(scan: MemoScanRecord, splatURL: URL) {
+    private func complete(scan: MemoScanRecord, gaussianFileURL: URL) {
         do {
+            let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
+            try? FileManager.default.removeItem(at: checkpointURL)
             _ = try store.markTrained(scan, iterations: totalIterations)
             iteration = totalIterations
-            phase = .rendering(splatURL)
+            previewGaussianFileURL = gaussianFileURL
+            previewReloadToken += 1
+            phase = .rendering(gaussianFileURL)
             task = nil
         } catch {
             fail(scan: scan, error)
@@ -221,7 +247,9 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     private nonisolated static func train(
         datasetPath: String,
         outputURL: URL,
+        checkpointURL: URL,
         iterations: Int,
+        previewInterval: Int,
         progress: @escaping @Sendable (TrainingProgressSnapshot) async -> Void
     ) async throws -> URL {
         let trainingImageDownscale: Float = 2.0
@@ -244,26 +272,63 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         config.bgColor = (0, 0, 0)
 
         let trainer = GaussianTrainer(dataset: dataset, config: config)
+        var startIteration = 0
+        if FileManager.default.fileExists(atPath: checkpointURL.path) {
+            startIteration = min(trainer.loadCheckpoint(from: checkpointURL.path), iterations)
+        }
 
-        for step in 1...iterations {
+        if FileManager.default.fileExists(atPath: outputURL.path), startIteration > 0 {
+            await progress(
+                TrainingProgressSnapshot(
+                    iteration: startIteration,
+                    splatCount: trainer.splatCount,
+                    didRefreshPreview: true,
+                    previewGaussianFileURL: outputURL
+                )
+            )
+        } else {
+            await progress(
+                TrainingProgressSnapshot(
+                    iteration: startIteration,
+                    splatCount: trainer.splatCount,
+                    didRefreshPreview: false,
+                    previewGaussianFileURL: nil
+                )
+            )
+        }
+
+        guard startIteration < iterations else {
+            if !FileManager.default.fileExists(atPath: outputURL.path) {
+                trainer.exportPly(to: outputURL.path)
+                msplatSync()
+            }
+            return outputURL
+        }
+
+        for step in (startIteration + 1)...iterations {
             try Task.checkCancellation()
             let stats = trainer.step()
-            if step == 1 || step.isMultiple(of: 10) || step == iterations {
+            let shouldRefreshPreview = step.isMultiple(of: previewInterval) || step == iterations
+            if shouldRefreshPreview {
+                try? FileManager.default.removeItem(at: checkpointURL)
+                trainer.saveCheckpoint(to: checkpointURL.path)
+                try? FileManager.default.removeItem(at: outputURL)
+                trainer.exportPly(to: outputURL.path)
+                msplatSync()
+            }
+
+            if step == 1 || step.isMultiple(of: 10) || shouldRefreshPreview {
                 await progress(
                     TrainingProgressSnapshot(
                         iteration: min(stats.iteration, iterations),
-                        splatCount: stats.splatCount
+                        splatCount: stats.splatCount,
+                        didRefreshPreview: shouldRefreshPreview,
+                        previewGaussianFileURL: shouldRefreshPreview ? outputURL : nil
                     )
                 )
             }
         }
 
-        try? FileManager.default.removeItem(at: outputURL)
-        trainer.exportSplat(to: outputURL.path)
-        let plyURL = outputURL.deletingPathExtension().appendingPathExtension("ply")
-        try? FileManager.default.removeItem(at: plyURL)
-        trainer.exportPly(to: plyURL.path)
-        msplatSync()
         return outputURL
     }
 }
@@ -280,6 +345,8 @@ private extension ScanTrainingController.Phase {
 private struct TrainingProgressSnapshot: Sendable {
     var iteration: Int
     var splatCount: Int
+    var didRefreshPreview: Bool
+    var previewGaussianFileURL: URL?
 }
 
 private struct TrainingBottomBar: View {
@@ -356,7 +423,8 @@ private struct TrainButton: View {
 }
 
 private struct GaussianSplatView: UIViewRepresentable {
-    let splatURL: URL
+    let gaussianFileURL: URL
+    let reloadToken: Int
 
     func makeCoordinator() -> GaussianSplatRendererCoordinator {
         GaussianSplatRendererCoordinator()
@@ -374,14 +442,15 @@ private struct GaussianSplatView: UIViewRepresentable {
         if let renderer = GaussianSplatRenderer(view: view) {
             context.coordinator.renderer = renderer
             view.delegate = renderer
-            renderer.load(url: splatURL)
+            renderer.load(url: gaussianFileURL)
         }
 
         return view
     }
 
     func updateUIView(_ uiView: MTKView, context: Context) {
-        context.coordinator.renderer?.load(url: splatURL)
+        context.coordinator.renderer?.load(url: gaussianFileURL, force: context.coordinator.reloadToken != reloadToken)
+        context.coordinator.reloadToken = reloadToken
     }
 }
 
@@ -403,6 +472,7 @@ private struct ActivityViewController: UIViewControllerRepresentable {
 
 private final class GaussianSplatRendererCoordinator {
     var renderer: GaussianSplatRenderer?
+    var reloadToken = 0
 }
 
 @MainActor
@@ -439,8 +509,8 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         configureGestures()
     }
 
-    func load(url: URL) {
-        guard loadedURL != url else { return }
+    func load(url: URL, force: Bool = false) {
+        guard force || loadedURL != url else { return }
         loadedURL = url
 
         Task { [weak self] in
