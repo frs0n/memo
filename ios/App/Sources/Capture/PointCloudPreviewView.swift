@@ -15,6 +15,8 @@ struct PointCloudPreviewView: View {
     @ObservedObject var store: MemoScanStore
 
     @StateObject private var trainer: ScanTrainingController
+    @State private var shareSheet: SharedFileSheetItem?
+    @State private var shareError: String?
 
     init(scan: MemoScanRecord, store: MemoScanStore) {
         self.scan = scan
@@ -59,10 +61,49 @@ struct PointCloudPreviewView: View {
                 }
                 .accessibilityLabel("Back")
             }
+
+            if trainer.phase.isRendering {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        shareGaussianPly()
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .accessibilityLabel("Share PLY")
+                }
+            }
+        }
+        .sheet(item: $shareSheet) { item in
+            ActivityViewController(activityItems: [item.url])
+        }
+        .alert("Unable to Share", isPresented: shareErrorBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(shareError ?? "The exported PLY file is unavailable.")
         }
         .onDisappear {
             trainer.cancel(scan: scan)
         }
+    }
+
+    private var shareErrorBinding: Binding<Bool> {
+        Binding(
+            get: { shareError != nil },
+            set: { isPresented in
+                if !isPresented {
+                    shareError = nil
+                }
+            }
+        )
+    }
+
+    private func shareGaussianPly() {
+        let url = scan.gaussianPlyURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            shareError = "This scan does not have an exported Gaussian PLY file yet."
+            return
+        }
+        shareSheet = SharedFileSheetItem(url: url)
     }
 }
 
@@ -207,8 +248,20 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
 
         try? FileManager.default.removeItem(at: outputURL)
         trainer.exportSplat(to: outputURL.path)
+        let plyURL = outputURL.deletingPathExtension().appendingPathExtension("ply")
+        try? FileManager.default.removeItem(at: plyURL)
+        trainer.exportPly(to: plyURL.path)
         msplatSync()
         return outputURL
+    }
+}
+
+private extension ScanTrainingController.Phase {
+    var isRendering: Bool {
+        if case .rendering = self {
+            return true
+        }
+        return false
     }
 }
 
@@ -318,6 +371,22 @@ private struct GaussianSplatView: UIViewRepresentable {
     func updateUIView(_ uiView: MTKView, context: Context) {
         context.coordinator.renderer?.load(url: splatURL)
     }
+}
+
+private struct SharedFileSheetItem: Identifiable {
+    let url: URL
+
+    var id: URL { url }
+}
+
+private struct ActivityViewController: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 private final class GaussianSplatRendererCoordinator {
