@@ -121,7 +121,7 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     @Published var splatCount = 0
     @Published var errorMessage: String?
 
-    let totalIterations = 2_000
+    let totalIterations = 4_500
     private let store: MemoScanStore
     private var task: Task<Void, Never>?
 
@@ -224,11 +224,23 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         iterations: Int,
         progress: @escaping @Sendable (TrainingProgressSnapshot) async -> Void
     ) async throws -> URL {
-        let dataset = GaussianDataset(path: datasetPath, downscaleFactor: 2.0)
+        let trainingImageDownscale: Float = 2.0
+        let dataset = GaussianDataset(path: datasetPath, downscaleFactor: trainingImageDownscale)
         var config = TrainingConfig()
         config.iterations = Int32(iterations)
-        config.downscaleFactor = 2.0
-        config.numDownscales = 1
+        config.shDegree = 3
+        config.shDegreeInterval = 1_000
+        config.ssimWeight = 0.2
+        config.downscaleFactor = trainingImageDownscale
+        config.numDownscales = 0
+        config.resolutionSchedule = 1_000
+        config.refineEvery = 100
+        config.warmupLength = 300
+        config.resetAlphaEvery = 20
+        config.densifyGradThresh = 0.00022
+        config.densifySizeThresh = 0.01
+        config.stopScreenSizeAt = 3_000
+        config.splitScreenSize = 0.05
         config.bgColor = (0, 0, 0)
 
         let trainer = GaussianTrainer(dataset: dataset, config: config)
