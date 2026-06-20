@@ -11,9 +11,16 @@ import simd
 struct PointCloudPreviewView: View {
     @Environment(\.dismiss) private var dismiss
 
-    let package: CaptureSessionPackage
+    let scan: MemoScanRecord
+    @ObservedObject var store: MemoScanStore
 
-    @StateObject private var trainer = ScanTrainingController()
+    @StateObject private var trainer: ScanTrainingController
+
+    init(scan: MemoScanRecord, store: MemoScanStore) {
+        self.scan = scan
+        self.store = store
+        _trainer = StateObject(wrappedValue: ScanTrainingController(scan: scan, store: store))
+    }
 
     var body: some View {
         ZStack {
@@ -22,7 +29,7 @@ struct PointCloudPreviewView: View {
 
             switch trainer.phase {
             case .idle, .training, .failed:
-                PointCloudSceneView(pointCloudURL: package.pointCloudURL)
+                PointCloudSceneView(pointCloudURL: scan.pointCloudURL)
                     .ignoresSafeArea()
             case .rendering(let splatURL):
                 GaussianSplatView(splatURL: splatURL)
@@ -36,7 +43,7 @@ struct PointCloudPreviewView: View {
                 totalIterations: trainer.totalIterations,
                 splatCount: trainer.splatCount,
                 errorMessage: trainer.errorMessage,
-                action: { trainer.start(package: package) }
+                action: { trainer.start(scan: scan) }
             )
         }
         .navigationTitle(trainer.navigationTitle)
@@ -54,13 +61,13 @@ struct PointCloudPreviewView: View {
             }
         }
         .onDisappear {
-            trainer.cancel()
+            trainer.cancel(scan: scan)
         }
     }
 }
 
 @MainActor
-private final class ScanTrainingController: ObservableObject {
+private final class ScanTrainingController: ObservableObject, @unchecked Sendable {
     enum Phase: Equatable {
         case idle
         case training
@@ -74,7 +81,20 @@ private final class ScanTrainingController: ObservableObject {
     @Published var errorMessage: String?
 
     let totalIterations = 2_000
+    private let store: MemoScanStore
     private var task: Task<Void, Never>?
+
+    init(scan: MemoScanRecord, store: MemoScanStore) {
+        self.store = store
+        errorMessage = scan.errorMessage
+        if scan.canRenderSplat {
+            phase = .rendering(scan.splatURL)
+        } else if scan.status == .failed {
+            phase = .failed
+        } else {
+            phase = .idle
+        }
+    }
 
     var navigationTitle: String {
         switch phase {
@@ -89,17 +109,23 @@ private final class ScanTrainingController: ObservableObject {
         }
     }
 
-    func start(package: CaptureSessionPackage) {
+    func start(scan: MemoScanRecord) {
         guard phase != .training else { return }
+        guard scan.canTrain else {
+            errorMessage = "Original training data is missing."
+            phase = .failed
+            return
+        }
 
         task?.cancel()
         phase = .training
         iteration = 0
         splatCount = 0
         errorMessage = nil
+        store.markTrainingStarted(scan)
 
-        let rootPath = package.rootURL.path
-        let outputURL = package.rootURL.appendingPathComponent("trained_2000.splat")
+        let rootPath = scan.packageURL.path
+        let outputURL = scan.splatURL
         let totalIterations = totalIterations
 
         let controller = self
@@ -112,15 +138,18 @@ private final class ScanTrainingController: ObservableObject {
                 ) { stats in
                     await controller.update(stats: stats)
                 }
-                await controller.complete(splatURL: splatURL)
+                await controller.complete(scan: scan, splatURL: splatURL)
             } catch is CancellationError {
             } catch {
-                await controller.fail(error)
+                await controller.fail(scan: scan, error)
             }
         }
     }
 
-    func cancel() {
+    func cancel(scan: MemoScanRecord) {
+        if phase == .training {
+            store.markTrainingCancelled(scan)
+        }
         task?.cancel()
         task = nil
     }
@@ -130,14 +159,20 @@ private final class ScanTrainingController: ObservableObject {
         splatCount = stats.splatCount
     }
 
-    private func complete(splatURL: URL) {
-        iteration = totalIterations
-        phase = .rendering(splatURL)
-        task = nil
+    private func complete(scan: MemoScanRecord, splatURL: URL) {
+        do {
+            _ = try store.markTrained(scan, iterations: totalIterations)
+            iteration = totalIterations
+            phase = .rendering(splatURL)
+            task = nil
+        } catch {
+            fail(scan: scan, error)
+        }
     }
 
-    private func fail(_ error: Error) {
+    private func fail(scan: MemoScanRecord, _ error: Error) {
         errorMessage = error.localizedDescription
+        store.markTrainingFailed(scan, message: error.localizedDescription)
         phase = .failed
         task = nil
     }

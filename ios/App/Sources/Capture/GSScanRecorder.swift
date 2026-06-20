@@ -5,14 +5,15 @@ import ImageIO
 import simd
 import UIKit
 
-struct CaptureIngestResult {
+struct CaptureIngestResult: Sendable {
     var didAcceptKeyframe: Bool
     var statusText: String
 }
 
-struct CaptureSessionPackage: Hashable {
+struct CaptureSessionPackage: Hashable, Sendable {
     var rootURL: URL
     var pointCloudURL: URL
+    var thumbnailURL: URL
     var keyframeCount: Int
     var pointCount: Int
 }
@@ -124,6 +125,7 @@ final class GSScanRecorder {
         return CaptureSessionPackage(
             rootURL: rootURL,
             pointCloudURL: pointCloudURL,
+            thumbnailURL: rootURL.appendingPathComponent("thumbnail.jpg"),
             keyframeCount: keyframeCount,
             pointCount: points.count
         )
@@ -146,6 +148,9 @@ final class GSScanRecorder {
 
         do {
             try jpeg.write(to: imageURL, options: .atomic)
+            if keyframeCount == 0, let rootURL {
+                try writeThumbnail(from: frame.capturedImage, to: rootURL.appendingPathComponent("thumbnail.jpg"))
+            }
             keyframeCount += 1
 
             let imageSize = CGSize(width: CVPixelBufferGetWidth(frame.capturedImage), height: CVPixelBufferGetHeight(frame.capturedImage))
@@ -162,6 +167,41 @@ final class GSScanRecorder {
             return true
         } catch {
             return false
+        }
+    }
+
+    private func writeThumbnail(from pixelBuffer: CVPixelBuffer, to url: URL) throws {
+        let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(Self.thumbnailOrientation())
+        let extent = source.extent
+        let maximumSide: CGFloat = 900
+        let scale = min(maximumSide / max(extent.width, extent.height), 1)
+        let resized = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+
+        guard let cgImage = ciContext.createCGImage(resized, from: resized.extent) else {
+            throw CaptureSessionError.thumbnailFailed
+        }
+
+        let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { _ in
+            UIImage(cgImage: cgImage).draw(in: CGRect(origin: .zero, size: size))
+        }
+        guard let data = image.jpegData(compressionQuality: 0.82) else {
+            throw CaptureSessionError.thumbnailFailed
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static func thumbnailOrientation() -> CGImagePropertyOrientation {
+        switch UIDevice.current.orientation {
+        case .landscapeLeft:
+            return .up
+        case .landscapeRight:
+            return .down
+        case .portraitUpsideDown:
+            return .left
+        default:
+            return .right
         }
     }
 
@@ -417,6 +457,7 @@ private struct CaptureQualityGates: Encodable {
 
 private enum CaptureSessionError: Error {
     case noActiveCapture
+    case thumbnailFailed
 }
 
 private extension JSONEncoder {

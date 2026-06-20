@@ -1,25 +1,34 @@
 import SwiftUI
+import UIKit
 
 struct RootView: View {
-    @State private var scans = MemoScan.sampleData
-    @State private var scanPendingDeletion: MemoScan?
+    @StateObject private var store = MemoScanStore()
+    @State private var path: [MemoScanRecord] = []
+    @State private var scanPendingDeletion: MemoScanRecord?
     @State private var isCapturing = false
-    @State private var capturedPreview: CaptureSessionPackage?
+    @State private var captureError: String?
 
     private let columns = [
         GridItem(.adaptive(minimum: 158, maximum: 240), spacing: 10)
     ]
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack(alignment: .bottom) {
                 Color(.systemBackground)
                     .ignoresSafeArea()
 
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 10) {
-                        ForEach(scans) { scan in
-                            ScanTile(scan: scan)
+                if store.scans.isEmpty {
+                    ContentUnavailableView("No scans", systemImage: "camera.viewfinder")
+                        .padding(.bottom, 72)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: 10) {
+                            ForEach(store.scans) { scan in
+                                NavigationLink(value: scan) {
+                                    ScanTile(scan: scan)
+                                }
+                                .buttonStyle(.plain)
                                 .contextMenu {
                                     Button(role: .destructive) {
                                         scanPendingDeletion = scan
@@ -30,13 +39,14 @@ struct RootView: View {
                                 .accessibilityAction(named: "Delete") {
                                     scanPendingDeletion = scan
                                 }
+                            }
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 14)
+                        .padding(.bottom, 104)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 14)
-                    .padding(.bottom, 104)
+                    .scrollIndicators(.hidden)
                 }
-                .scrollIndicators(.hidden)
 
                 AddScanButton {
                     isCapturing = true
@@ -45,6 +55,9 @@ struct RootView: View {
             }
             .navigationTitle("memo")
             .navigationBarTitleDisplayMode(.large)
+            .navigationDestination(for: MemoScanRecord.self) { scan in
+                ScanDestinationView(scanID: scan.id, store: store)
+            }
             .alert("Delete scan?", isPresented: deleteAlertBinding, presenting: scanPendingDeletion) { scan in
                 Button("Delete", role: .destructive) {
                     delete(scan)
@@ -55,17 +68,19 @@ struct RootView: View {
             } message: { scan in
                 Text("\(scan.title) will be removed from this device.")
             }
+            .alert("Capture could not be saved", isPresented: captureErrorBinding) {
+                Button("OK", role: .cancel) {
+                    captureError = nil
+                }
+            } message: {
+                Text(captureError ?? "Unknown error")
+            }
             .fullScreenCover(isPresented: $isCapturing) {
                 CaptureView { package in
-                    addCapturedScan(package: package)
-                    capturedPreview = package
-                    isCapturing = false
+                    finishCapture(package: package)
                 }
                 .ignoresSafeArea()
                 .statusBarHidden(true)
-            }
-            .navigationDestination(item: $capturedPreview) { package in
-                PointCloudPreviewView(package: package)
             }
         }
     }
@@ -81,63 +96,83 @@ struct RootView: View {
         )
     }
 
-    private func delete(_ scan: MemoScan) {
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-            scans.removeAll { $0.id == scan.id }
-            scanPendingDeletion = nil
+    private var captureErrorBinding: Binding<Bool> {
+        Binding(
+            get: { captureError != nil },
+            set: { isPresented in
+                if !isPresented {
+                    captureError = nil
+                }
+            }
+        )
+    }
+
+    private func finishCapture(package: CaptureSessionPackage) {
+        do {
+            let scan = try store.ingest(package: package)
+            isCapturing = false
+            path.append(scan)
+        } catch {
+            isCapturing = false
+            captureError = error.localizedDescription
         }
     }
 
-    private func addCapturedScan(package: CaptureSessionPackage) {
-        let newScan = MemoScan(
-            title: package.rootURL.lastPathComponent,
-            subtitle: "\(package.keyframeCount) frames",
-            symbolName: "camera.viewfinder",
-            tone: .highlight
-        )
+    private func delete(_ scan: MemoScanRecord) {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            store.delete(scan)
+            scanPendingDeletion = nil
+        }
+    }
+}
 
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-            scans.insert(newScan, at: 0)
+private struct ScanDestinationView: View {
+    let scanID: UUID
+    @ObservedObject var store: MemoScanStore
+
+    var body: some View {
+        if let scan = store.record(id: scanID) {
+            PointCloudPreviewView(scan: scan, store: store)
+        } else {
+            ContentUnavailableView("Scan missing", systemImage: "exclamationmark.triangle")
         }
     }
 }
 
 private struct ScanTile: View {
-    let scan: MemoScan
+    let scan: MemoScanRecord
 
     var body: some View {
         GeometryReader { proxy in
-            ZStack(alignment: .bottomLeading) {
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(scan.tone.fillStyle)
-
-                ScanTexture(symbolName: scan.symbolName)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(scan.title)
-            .frame(width: proxy.size.width, height: proxy.size.height)
+            ScanThumbnail(url: scan.thumbnailURL)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(scan.title), \(scan.subtitle)")
+                .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .aspectRatio(0.78, contentMode: .fit)
     }
 }
 
-private struct ScanTexture: View {
-    let symbolName: String
+private struct ScanThumbnail: View {
+    let url: URL
 
     var body: some View {
-        ZStack {
-            Image(systemName: symbolName)
-                .font(.system(size: 48, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.72))
-                .symbolRenderingMode(.hierarchical)
-        }
-        .overlay {
+        if let image = UIImage(contentsOfFile: url.path) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+        } else {
             Rectangle()
-                .fill(.primary.opacity(0.03))
-                .blendMode(.overlay)
+                .fill(Color(.secondarySystemFill))
+                .overlay {
+                    Image(systemName: "photo")
+                        .font(.system(size: 38, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
         }
     }
 }
@@ -165,46 +200,6 @@ private struct AddScanButton: View {
             .buttonBorderShape(.circle)
             .controlSize(.large)
             .accessibilityLabel("Create scan")
-        }
-    }
-}
-
-private struct MemoScan: Identifiable, Equatable {
-    let id = UUID()
-    var title: String
-    var subtitle: String
-    var symbolName: String
-    var tone: MemoTone
-
-    static let sampleData: [MemoScan] = [
-        MemoScan(title: "Desk light", subtitle: "46 frames", symbolName: "macbook.and.iphone", tone: .soft),
-        MemoScan(title: "Window trace", subtitle: "local render ready", symbolName: "rectangle.split.2x1", tone: .contrast),
-        MemoScan(title: "Tiny shrine", subtitle: "training 62%", symbolName: "sparkles.rectangle.stack", tone: .raised),
-        MemoScan(title: "Room corner", subtitle: "128 frames", symbolName: "cube.transparent", tone: .contrast),
-        MemoScan(title: "Work table", subtitle: "local capture", symbolName: "camera.metering.center.weighted", tone: .soft),
-        MemoScan(title: "Laptop", subtitle: "3D Gaussian", symbolName: "laptopcomputer", tone: .deep)
-    ]
-}
-
-private enum MemoTone {
-    case soft
-    case raised
-    case contrast
-    case deep
-    case highlight
-
-    var fillStyle: AnyShapeStyle {
-        switch self {
-        case .soft:
-            return AnyShapeStyle(.thinMaterial)
-        case .raised:
-            return AnyShapeStyle(.regularMaterial)
-        case .contrast:
-            return AnyShapeStyle(Color(.secondarySystemFill))
-        case .deep:
-            return AnyShapeStyle(Color(.tertiarySystemFill))
-        case .highlight:
-            return AnyShapeStyle(Color(.quaternarySystemFill))
         }
     }
 }
