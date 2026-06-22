@@ -52,6 +52,10 @@ struct PointCloudPreviewView: View {
                 totalIterations: trainer.totalIterations,
                 splatCount: trainer.splatCount,
                 errorMessage: trainer.errorMessage,
+                mode: Binding(
+                    get: { trainer.trainingMode },
+                    set: { trainer.trainingMode = $0 }
+                ),
                 action: { trainer.start(scan: scan) }
             )
         }
@@ -129,9 +133,9 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     @Published var errorMessage: String?
     @Published var previewGaussianFileURL: URL?
     @Published var previewReloadToken = 0
+    @Published var trainingMode: ScanTrainingMode = .fast
 
-    let trainingPreset = ScanTrainingPreset.lidarFastPreview
-    var totalIterations: Int { trainingPreset.iterations }
+    var totalIterations: Int { trainingMode.preset.iterations }
     private let store: MemoScanStore
     private var task: Task<Void, Never>?
     private let previewInterval = 1_000
@@ -177,8 +181,7 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         let rootPath = scan.packageURL.path
         let outputURL = scan.gaussianPlyURL
         let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
-        let preset = trainingPreset
-        let totalIterations = preset.iterations
+        let preset = trainingMode.preset
         let previewInterval = previewInterval
 
         if !FileManager.default.fileExists(atPath: outputURL.path) {
@@ -228,8 +231,8 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         do {
             let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
             try? FileManager.default.removeItem(at: checkpointURL)
-            _ = try store.markTrained(scan, iterations: trainingPreset.iterations)
-            iteration = trainingPreset.iterations
+            _ = try store.markTrained(scan, iterations: trainingMode.preset.iterations)
+            iteration = trainingMode.preset.iterations
             previewGaussianFileURL = gaussianFileURL
             previewReloadToken += 1
             phase = .rendering(gaussianFileURL)
@@ -319,6 +322,29 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     }
 }
 
+private enum ScanTrainingMode: String, CaseIterable, Identifiable {
+    case fast
+    case quality
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fast: return "Fast"
+        case .quality: return "Quality"
+        }
+    }
+
+    var preset: ScanTrainingPreset {
+        switch self {
+        case .fast:
+            return .fast
+        case .quality:
+            return .quality
+        }
+    }
+}
+
 private struct ScanTrainingPreset: Sendable {
     var iterations: Int
     var imageDownscale: Float
@@ -329,15 +355,26 @@ private struct ScanTrainingPreset: Sendable {
     var resetAlphaEvery: Int32
     var densifyGradThresh: Float
 
-    static let lidarFastPreview = ScanTrainingPreset(
-        iterations: 3_500,
+    static let fast = ScanTrainingPreset(
+        iterations: 1_900,
         imageDownscale: 2,
         numDownscales: 2,
-        resolutionSchedule: 2_000,
+        resolutionSchedule: 500,
         refineEvery: 150,
         warmupLength: 300,
         resetAlphaEvery: 30,
-        densifyGradThresh: 0.0003
+        densifyGradThresh: 0.0004
+    )
+
+    static let quality = ScanTrainingPreset(
+        iterations: 4_500,
+        imageDownscale: 2,
+        numDownscales: 2,
+        resolutionSchedule: 2_000,
+        refineEvery: 100,
+        warmupLength: 300,
+        resetAlphaEvery: 30,
+        densifyGradThresh: 0.00022
     )
 
     var trainingConfig: TrainingConfig {
@@ -383,12 +420,14 @@ private struct TrainingBottomBar: View {
     let totalIterations: Int
     let splatCount: Int
     let errorMessage: String?
+    @Binding var mode: ScanTrainingMode
     let action: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             switch phase {
             case .idle:
+                TrainingModeSelector(mode: $mode)
                 TrainButton(action: action)
             case .training:
                 TrainingProgressBar(iteration: iteration, totalIterations: totalIterations)
@@ -404,6 +443,7 @@ private struct TrainingBottomBar: View {
                         .font(.caption)
                         .lineLimit(2)
                         .foregroundStyle(.red)
+                    TrainingModeSelector(mode: $mode)
                     TrainButton(action: action)
                 }
             }
@@ -412,6 +452,64 @@ private struct TrainingBottomBar: View {
         .padding(.top, 12)
         .padding(.bottom, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct TrainingModeSelector: View {
+    @Binding var mode: ScanTrainingMode
+
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
+                    ForEach(ScanTrainingMode.allCases) { item in
+                        modeButton(item)
+                    }
+                }
+            }
+        } else {
+            Picker("Training Mode", selection: $mode) {
+                ForEach(ScanTrainingMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityLabel("Training mode")
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private func modeButton(_ item: ScanTrainingMode) -> some View {
+        Button {
+            withAnimation(.snappy(duration: 0.18)) {
+                mode = item
+            }
+        } label: {
+            Text(item.title)
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 36)
+                .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
+        .modifier(TrainingModeGlassStyle(isSelected: mode == item))
+        .accessibilityAddTraits(mode == item ? .isSelected : [])
+    }
+}
+
+@available(iOS 26.0, *)
+private struct TrainingModeGlassStyle: ViewModifier {
+    var isSelected: Bool
+
+    func body(content: Content) -> some View {
+        if isSelected {
+            content
+                .foregroundStyle(.primary)
+                .glassEffect(.regular.tint(.primary.opacity(0.16)).interactive(), in: .capsule)
+        } else {
+            content
+                .foregroundStyle(.secondary)
+                .glassEffect(.regular.interactive(), in: .capsule)
+        }
     }
 }
 
