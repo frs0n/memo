@@ -31,6 +31,8 @@ final class GSScanRecorder {
     private let candidateWindowSize = 8
     private let depthSampleStride = 3
     private let maximumPointCount = 700_000
+    private let trainingPriorVoxelSize: Float = 0.01
+    private let maximumTrainingPriorPointCount = 45_000
 
     private var rootURL: URL?
     private var imagesURL: URL?
@@ -164,16 +166,17 @@ final class GSScanRecorder {
 
         try camerasText.write(to: sparseURL.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
         try imagesText.write(to: sparseURL.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+        let trainingPoints = makeTrainingPrior(from: points)
         let pointCloudURL = depthURL.appendingPathComponent("fused_points.ply")
-        try writePLY(to: pointCloudURL)
-        try writeManifest(to: rootURL.appendingPathComponent("capture.json"))
+        try writePLY(trainingPoints, to: pointCloudURL)
+        try writeManifest(pointCount: trainingPoints.count, to: rootURL.appendingPathComponent("capture.json"))
 
         return CaptureSessionPackage(
             rootURL: rootURL,
             pointCloudURL: pointCloudURL,
             thumbnailURL: rootURL.appendingPathComponent("thumbnail.jpg"),
             keyframeCount: keyframeCount,
-            pointCount: points.count
+            pointCount: trainingPoints.count
         )
     }
 
@@ -505,7 +508,7 @@ final class GSScanRecorder {
         return DepthSample(points: sampledPoints, stats: stats)
     }
 
-    private func writePLY(to url: URL) throws {
+    private func writePLY(_ points: [PLYPoint], to url: URL) throws {
         var text = """
         ply
         format ascii 1.0
@@ -525,12 +528,34 @@ final class GSScanRecorder {
         try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private func writeManifest(to url: URL) throws {
+    private func makeTrainingPrior(from points: [PLYPoint]) -> [PLYPoint] {
+        guard !points.isEmpty else { return [] }
+
+        var voxels: [VoxelKey: VoxelAccumulator] = [:]
+        voxels.reserveCapacity(min(points.count, maximumTrainingPriorPointCount * 2))
+
+        for point in points {
+            voxels[VoxelKey(point: point, voxelSize: trainingPriorVoxelSize), default: VoxelAccumulator()].add(point)
+        }
+
+        return voxels
+            .map { key, accumulator in (key, accumulator) }
+            .sorted {
+                if $0.1.count != $1.1.count {
+                    return $0.1.count > $1.1.count
+                }
+                return $0.0 < $1.0
+            }
+            .prefix(maximumTrainingPriorPointCount)
+            .map { $0.1.plyPoint }
+    }
+
+    private func writeManifest(pointCount: Int, to url: URL) throws {
         let manifest = CaptureManifest(
             format: "memo-arkit-colmap-like-v1",
             createdAt: ISO8601DateFormatter().string(from: Date()),
             keyframeCount: keyframeCount,
-            pointCount: points.count,
+            pointCount: pointCount,
             camera: "ARKit back wide camera, requested 4:3 video format and 1x/no-digital-zoom capture",
             qualityGates: CaptureQualityGates(
                 tracking: "ARCamera.TrackingState.normal",
@@ -659,6 +684,56 @@ private struct PLYPoint {
     var r: UInt8
     var g: UInt8
     var b: UInt8
+}
+
+private struct VoxelKey: Hashable, Comparable {
+    var x: Int
+    var y: Int
+    var z: Int
+
+    init(point: PLYPoint, voxelSize: Float) {
+        x = Int(floor(point.x / voxelSize))
+        y = Int(floor(point.y / voxelSize))
+        z = Int(floor(point.z / voxelSize))
+    }
+
+    static func < (lhs: VoxelKey, rhs: VoxelKey) -> Bool {
+        if lhs.x != rhs.x { return lhs.x < rhs.x }
+        if lhs.y != rhs.y { return lhs.y < rhs.y }
+        return lhs.z < rhs.z
+    }
+}
+
+private struct VoxelAccumulator {
+    private(set) var count = 0
+    private var x: Double = 0
+    private var y: Double = 0
+    private var z: Double = 0
+    private var r: Int = 0
+    private var g: Int = 0
+    private var b: Int = 0
+
+    mutating func add(_ point: PLYPoint) {
+        count += 1
+        x += Double(point.x)
+        y += Double(point.y)
+        z += Double(point.z)
+        r += Int(point.r)
+        g += Int(point.g)
+        b += Int(point.b)
+    }
+
+    var plyPoint: PLYPoint {
+        let divisor = Double(max(count, 1))
+        return PLYPoint(
+            x: Float(x / divisor),
+            y: Float(y / divisor),
+            z: Float(z / divisor),
+            r: UInt8(clamping: r / max(count, 1)),
+            g: UInt8(clamping: g / max(count, 1)),
+            b: UInt8(clamping: b / max(count, 1))
+        )
+    }
 }
 
 private struct DepthStats {

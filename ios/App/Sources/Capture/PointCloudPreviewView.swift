@@ -130,7 +130,8 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     @Published var previewGaussianFileURL: URL?
     @Published var previewReloadToken = 0
 
-    let totalIterations = 4_500
+    let trainingPreset = ScanTrainingPreset.lidarFastPreview
+    var totalIterations: Int { trainingPreset.iterations }
     private let store: MemoScanStore
     private var task: Task<Void, Never>?
     private let previewInterval = 1_000
@@ -176,7 +177,8 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         let rootPath = scan.packageURL.path
         let outputURL = scan.gaussianPlyURL
         let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
-        let totalIterations = totalIterations
+        let preset = trainingPreset
+        let totalIterations = preset.iterations
         let previewInterval = previewInterval
 
         if !FileManager.default.fileExists(atPath: outputURL.path) {
@@ -192,7 +194,7 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
                     datasetPath: rootPath,
                     outputURL: outputURL,
                     checkpointURL: checkpointURL,
-                    iterations: totalIterations,
+                    preset: preset,
                     previewInterval: previewInterval
                 ) { stats in
                     await controller.update(stats: stats)
@@ -226,8 +228,8 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         do {
             let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
             try? FileManager.default.removeItem(at: checkpointURL)
-            _ = try store.markTrained(scan, iterations: totalIterations)
-            iteration = totalIterations
+            _ = try store.markTrained(scan, iterations: trainingPreset.iterations)
+            iteration = trainingPreset.iterations
             previewGaussianFileURL = gaussianFileURL
             previewReloadToken += 1
             phase = .rendering(gaussianFileURL)
@@ -248,33 +250,17 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         datasetPath: String,
         outputURL: URL,
         checkpointURL: URL,
-        iterations: Int,
+        preset: ScanTrainingPreset,
         previewInterval: Int,
         progress: @escaping @Sendable (TrainingProgressSnapshot) async -> Void
     ) async throws -> URL {
-        let trainingImageDownscale: Float = 2.0
-        let dataset = GaussianDataset(path: datasetPath, downscaleFactor: trainingImageDownscale)
-        var config = TrainingConfig()
-        config.iterations = Int32(iterations)
-        config.shDegree = 3
-        config.shDegreeInterval = 1_000
-        config.ssimWeight = 0.2
-        config.downscaleFactor = trainingImageDownscale
-        config.numDownscales = 0
-        config.resolutionSchedule = 1_000
-        config.refineEvery = 100
-        config.warmupLength = 300
-        config.resetAlphaEvery = 20
-        config.densifyGradThresh = 0.00022
-        config.densifySizeThresh = 0.01
-        config.stopScreenSizeAt = 3_000
-        config.splitScreenSize = 0.05
-        config.bgColor = (0, 0, 0)
+        let dataset = GaussianDataset(path: datasetPath, downscaleFactor: preset.imageDownscale)
+        let config = preset.trainingConfig
 
         let trainer = GaussianTrainer(dataset: dataset, config: config)
         var startIteration = 0
         if FileManager.default.fileExists(atPath: checkpointURL.path) {
-            startIteration = min(trainer.loadCheckpoint(from: checkpointURL.path), iterations)
+            startIteration = min(trainer.loadCheckpoint(from: checkpointURL.path), preset.iterations)
         }
 
         if FileManager.default.fileExists(atPath: outputURL.path), startIteration > 0 {
@@ -297,7 +283,7 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
             )
         }
 
-        guard startIteration < iterations else {
+        guard startIteration < preset.iterations else {
             if !FileManager.default.fileExists(atPath: outputURL.path) {
                 trainer.exportPly(to: outputURL.path)
                 msplatSync()
@@ -305,10 +291,10 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
             return outputURL
         }
 
-        for step in (startIteration + 1)...iterations {
+        for step in (startIteration + 1)...preset.iterations {
             try Task.checkCancellation()
             let stats = trainer.step()
-            let shouldRefreshPreview = step.isMultiple(of: previewInterval) || step == iterations
+            let shouldRefreshPreview = step.isMultiple(of: previewInterval) || step == preset.iterations
             if shouldRefreshPreview {
                 try? FileManager.default.removeItem(at: checkpointURL)
                 trainer.saveCheckpoint(to: checkpointURL.path)
@@ -320,7 +306,7 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
             if step == 1 || step.isMultiple(of: 10) || shouldRefreshPreview {
                 await progress(
                     TrainingProgressSnapshot(
-                        iteration: min(stats.iteration, iterations),
+                        iteration: min(stats.iteration, preset.iterations),
                         splatCount: stats.splatCount,
                         didRefreshPreview: shouldRefreshPreview,
                         previewGaussianFileURL: shouldRefreshPreview ? outputURL : nil
@@ -330,6 +316,48 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         }
 
         return outputURL
+    }
+}
+
+private struct ScanTrainingPreset: Sendable {
+    var iterations: Int
+    var imageDownscale: Float
+    var numDownscales: Int32
+    var resolutionSchedule: Int32
+    var refineEvery: Int32
+    var warmupLength: Int32
+    var resetAlphaEvery: Int32
+    var densifyGradThresh: Float
+
+    static let lidarFastPreview = ScanTrainingPreset(
+        iterations: 3_500,
+        imageDownscale: 2,
+        numDownscales: 2,
+        resolutionSchedule: 2_000,
+        refineEvery: 150,
+        warmupLength: 300,
+        resetAlphaEvery: 30,
+        densifyGradThresh: 0.0003
+    )
+
+    var trainingConfig: TrainingConfig {
+        var config = TrainingConfig()
+        config.iterations = Int32(iterations)
+        config.shDegree = 3
+        config.shDegreeInterval = 1_000
+        config.ssimWeight = 0.2
+        config.downscaleFactor = imageDownscale
+        config.numDownscales = numDownscales
+        config.resolutionSchedule = resolutionSchedule
+        config.refineEvery = refineEvery
+        config.warmupLength = warmupLength
+        config.resetAlphaEvery = resetAlphaEvery
+        config.densifyGradThresh = densifyGradThresh
+        config.densifySizeThresh = 0.01
+        config.stopScreenSizeAt = 3_000
+        config.splitScreenSize = 0.05
+        config.bgColor = (0, 0, 0)
+        return config
     }
 }
 
