@@ -2,7 +2,6 @@ import Metal
 import MetalKit
 import MetalSplatter
 import Msplat
-import SceneKit
 import SplatIO
 import SwiftUI
 import UIKit
@@ -29,20 +28,18 @@ struct PointCloudPreviewView: View {
             Color(.systemBackground)
                 .ignoresSafeArea()
 
-            if let gaussianFileURL = trainer.previewGaussianFileURL {
+            if let previewImage = trainer.previewImage {
+                TrainingImagePreview(image: previewImage)
+                    .ignoresSafeArea()
+            } else if let gaussianFileURL = trainer.previewGaussianFileURL {
                 GaussianSplatView(
                     gaussianFileURL: gaussianFileURL,
                     reloadToken: trainer.previewReloadToken
                 )
                 .ignoresSafeArea()
             } else {
-                switch trainer.phase {
-                case .idle, .training, .failed:
-                    PointCloudSceneView(pointCloudURL: scan.pointCloudURL)
-                        .ignoresSafeArea()
-                case .rendering:
-                    EmptyView()
-                }
+                PreviewPlaceholder(thumbnailURL: scan.thumbnailURL)
+                    .ignoresSafeArea()
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -76,11 +73,11 @@ struct PointCloudPreviewView: View {
             if trainer.phase.isRendering {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        shareGaussianPly()
+                        shareGaussianSplat()
                     } label: {
                         Image(systemName: "square.and.arrow.up")
                     }
-                    .accessibilityLabel("Share PLY")
+                    .accessibilityLabel("Share splat")
                 }
             }
         }
@@ -90,7 +87,7 @@ struct PointCloudPreviewView: View {
         .alert("Unable to Share", isPresented: shareErrorBinding) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(shareError ?? "The exported PLY file is unavailable.")
+            Text(shareError ?? "The exported splat file is unavailable.")
         }
         .onDisappear {
             trainer.cancel(scan: scan)
@@ -108,10 +105,10 @@ struct PointCloudPreviewView: View {
         )
     }
 
-    private func shareGaussianPly() {
-        let url = scan.gaussianPlyURL
+    private func shareGaussianSplat() {
+        let url = scan.gaussianSplatURL
         guard FileManager.default.fileExists(atPath: url.path) else {
-            shareError = "This scan does not have an exported Gaussian PLY file yet."
+            shareError = "This scan does not have an exported Gaussian splat file yet."
             return
         }
         shareSheet = SharedFileSheetItem(url: url)
@@ -131,6 +128,7 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     @Published var iteration = 0
     @Published var splatCount = 0
     @Published var errorMessage: String?
+    @Published var previewImage: UIImage?
     @Published var previewGaussianFileURL: URL?
     @Published var previewReloadToken = 0
     @Published var trainingMode: ScanTrainingMode = .fast
@@ -138,14 +136,14 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     var totalIterations: Int { trainingMode.preset.iterations }
     private let store: MemoScanStore
     private var task: Task<Void, Never>?
-    private let previewInterval = 1_000
+    private let previewInterval = 120
 
     init(scan: MemoScanRecord, store: MemoScanStore) {
         self.store = store
         errorMessage = scan.errorMessage
         if scan.canRenderGaussian {
-            phase = .rendering(scan.gaussianPlyURL)
-            previewGaussianFileURL = scan.gaussianPlyURL
+            phase = .rendering(scan.gaussianSplatURL)
+            previewGaussianFileURL = scan.gaussianSplatURL
         } else if scan.status == .failed {
             phase = .failed
         } else {
@@ -179,15 +177,18 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
         splatCount = 0
         errorMessage = nil
         let rootPath = scan.packageURL.path
-        let outputURL = scan.gaussianPlyURL
-        let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
+        let outputURL = scan.gaussianSplatURL
         let preset = trainingMode.preset
         let previewInterval = previewInterval
+        let fileManager = FileManager.default
 
         if !FileManager.default.fileExists(atPath: outputURL.path) {
             previewGaussianFileURL = nil
             previewReloadToken = 0
         }
+        previewImage = nil
+        try? fileManager.removeItem(at: scan.legacyGaussianPlyURL)
+        try? fileManager.removeItem(at: outputURL)
         store.markTrainingStarted(scan)
 
         let controller = self
@@ -196,7 +197,6 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
                 let gaussianFileURL = try await Self.train(
                     datasetPath: rootPath,
                     outputURL: outputURL,
-                    checkpointURL: checkpointURL,
                     preset: preset,
                     previewInterval: previewInterval
                 ) { stats in
@@ -221,7 +221,11 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     private func update(stats: TrainingProgressSnapshot) {
         iteration = stats.iteration
         splatCount = stats.splatCount
-        if stats.didRefreshPreview {
+        if let preview = stats.previewFrame {
+            previewImage = preview.uiImage
+        }
+        if stats.didFinishExport {
+            previewImage = nil
             previewGaussianFileURL = stats.previewGaussianFileURL
             previewReloadToken += 1
         }
@@ -229,10 +233,10 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
 
     private func complete(scan: MemoScanRecord, gaussianFileURL: URL) {
         do {
-            let checkpointURL = scan.packageURL.appendingPathComponent("training.ckpt")
-            try? FileManager.default.removeItem(at: checkpointURL)
+            try? FileManager.default.removeItem(at: scan.legacyGaussianPlyURL)
             _ = try store.markTrained(scan, iterations: trainingMode.preset.iterations)
             iteration = trainingMode.preset.iterations
+            previewImage = nil
             previewGaussianFileURL = gaussianFileURL
             previewReloadToken += 1
             phase = .rendering(gaussianFileURL)
@@ -252,73 +256,93 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
     private nonisolated static func train(
         datasetPath: String,
         outputURL: URL,
-        checkpointURL: URL,
         preset: ScanTrainingPreset,
         previewInterval: Int,
         progress: @escaping @Sendable (TrainingProgressSnapshot) async -> Void
     ) async throws -> URL {
         let dataset = GaussianDataset(path: datasetPath, downscaleFactor: preset.imageDownscale)
         let config = preset.trainingConfig
+        let previewPose = dataset.cameraPose(at: 0)
 
         let trainer = GaussianTrainer(dataset: dataset, config: config)
-        var startIteration = 0
-        if FileManager.default.fileExists(atPath: checkpointURL.path) {
-            startIteration = min(trainer.loadCheckpoint(from: checkpointURL.path), preset.iterations)
-        }
-
-        if FileManager.default.fileExists(atPath: outputURL.path), startIteration > 0 {
-            await progress(
-                TrainingProgressSnapshot(
-                    iteration: startIteration,
-                    splatCount: trainer.splatCount,
-                    didRefreshPreview: true,
-                    previewGaussianFileURL: outputURL
-                )
+        await progress(
+            TrainingProgressSnapshot(
+                iteration: 0,
+                splatCount: trainer.splatCount,
+                didFinishExport: false,
+                previewFrame: nil,
+                previewGaussianFileURL: nil
             )
-        } else {
-            await progress(
-                TrainingProgressSnapshot(
-                    iteration: startIteration,
-                    splatCount: trainer.splatCount,
-                    didRefreshPreview: false,
-                    previewGaussianFileURL: nil
-                )
-            )
-        }
+        )
 
-        guard startIteration < preset.iterations else {
-            if !FileManager.default.fileExists(atPath: outputURL.path) {
-                trainer.exportPly(to: outputURL.path)
-                msplatSync()
-            }
-            return outputURL
-        }
-
-        for step in (startIteration + 1)...preset.iterations {
+        for step in 1...preset.iterations {
             try Task.checkCancellation()
             let stats = trainer.step()
-            let shouldRefreshPreview = step.isMultiple(of: previewInterval) || step == preset.iterations
-            if shouldRefreshPreview {
-                try? FileManager.default.removeItem(at: checkpointURL)
-                trainer.saveCheckpoint(to: checkpointURL.path)
-                try? FileManager.default.removeItem(at: outputURL)
-                trainer.exportPly(to: outputURL.path)
-                msplatSync()
-            }
+            let shouldRefreshPreview = step == 1 || step.isMultiple(of: previewInterval)
+            let previewFrame = shouldRefreshPreview ? renderPreviewFrame(trainer: trainer, camToWorld: previewPose) : nil
 
-            if step == 1 || step.isMultiple(of: 10) || shouldRefreshPreview {
+            if step == 1 || step.isMultiple(of: 10) || shouldRefreshPreview || step == preset.iterations {
                 await progress(
                     TrainingProgressSnapshot(
                         iteration: min(stats.iteration, preset.iterations),
                         splatCount: stats.splatCount,
-                        didRefreshPreview: shouldRefreshPreview,
-                        previewGaussianFileURL: shouldRefreshPreview ? outputURL : nil
+                        didFinishExport: false,
+                        previewFrame: previewFrame,
+                        previewGaussianFileURL: nil
                     )
                 )
             }
         }
 
+        try exportFinalSplat(trainer: trainer, to: outputURL)
+        await progress(
+            TrainingProgressSnapshot(
+                iteration: preset.iterations,
+                splatCount: trainer.splatCount,
+                didFinishExport: true,
+                previewFrame: nil,
+                previewGaussianFileURL: outputURL
+            )
+        )
+
         return outputURL
+    }
+
+    private nonisolated static func exportFinalSplat(trainer: GaussianTrainer, to outputURL: URL) throws {
+        let tempURL = outputURL.deletingPathExtension().appendingPathExtension("exporting.splat")
+        let fileManager = FileManager.default
+
+        try? fileManager.removeItem(at: tempURL)
+        trainer.exportSplat(to: tempURL.path)
+        msplatSync()
+
+        if fileManager.fileExists(atPath: outputURL.path) {
+            _ = try fileManager.replaceItemAt(outputURL, withItemAt: tempURL)
+        } else {
+            try fileManager.moveItem(at: tempURL, to: outputURL)
+        }
+    }
+
+    private nonisolated static func renderPreviewFrame(
+        trainer: GaussianTrainer,
+        camToWorld: [Float]
+    ) -> TrainingPreviewFrame? {
+        var width: Int32 = 0
+        var height: Int32 = 0
+        trainer.renderFromPoseToBuffer(camToWorld: camToWorld, rgba: nil, width: &width, height: &height)
+
+        guard width > 0, height > 0 else { return nil }
+
+        var rgba = [UInt8](repeating: 0, count: Int(width * height * 4))
+        rgba.withUnsafeMutableBufferPointer { buffer in
+            trainer.renderFromPoseToBuffer(
+                camToWorld: camToWorld,
+                rgba: buffer.baseAddress,
+                width: &width,
+                height: &height
+            )
+        }
+        return TrainingPreviewFrame(rgba: Data(rgba), width: Int(width), height: Int(height))
     }
 }
 
@@ -410,8 +434,37 @@ private extension ScanTrainingController.Phase {
 private struct TrainingProgressSnapshot: Sendable {
     var iteration: Int
     var splatCount: Int
-    var didRefreshPreview: Bool
+    var didFinishExport: Bool
+    var previewFrame: TrainingPreviewFrame?
     var previewGaussianFileURL: URL?
+}
+
+private struct TrainingPreviewFrame: Sendable {
+    var rgba: Data
+    var width: Int
+    var height: Int
+
+    @MainActor
+    var uiImage: UIImage? {
+        guard let provider = CGDataProvider(data: rgba as CFData) else { return nil }
+        guard let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+        ) else {
+            return nil
+        }
+        let orientation: UIImage.Orientation = width > height ? .right : .up
+        return UIImage(cgImage: image, scale: 1, orientation: orientation)
+    }
 }
 
 private struct TrainingBottomBar: View {
@@ -544,6 +597,41 @@ private struct TrainButton: View {
                 .buttonBorderShape(.capsule)
                 .controlSize(.large)
                 .accessibilityLabel("Train")
+        }
+    }
+}
+
+private struct PreviewPlaceholder: View {
+    let thumbnailURL: URL
+
+    var body: some View {
+        ZStack {
+            Color.black
+
+            if let image = UIImage(contentsOfFile: thumbnailURL.path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "sparkles.rectangle.stack")
+                    .font(.system(size: 42, weight: .medium))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+private struct TrainingImagePreview: View {
+    let image: UIImage
+
+    var body: some View {
+        ZStack {
+            Color.black
+
+            Image(uiImage: image)
+                .resizable()
+                .interpolation(.none)
+                .scaledToFit()
         }
     }
 }
@@ -809,160 +897,6 @@ private final class SimultaneousSplatGestureDelegate: NSObject, UIGestureRecogni
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         true
-    }
-}
-
-private struct PointCloudSceneView: UIViewRepresentable {
-    let pointCloudURL: URL
-
-    func makeUIView(context: Context) -> SCNView {
-        let view = SCNView(frame: .zero)
-        view.backgroundColor = .systemBackground
-        view.allowsCameraControl = true
-        view.autoenablesDefaultLighting = false
-        view.scene = PointCloudSceneBuilder.scene(from: pointCloudURL)
-        return view
-    }
-
-    func updateUIView(_ uiView: SCNView, context: Context) {}
-}
-
-private enum PointCloudSceneBuilder {
-    static func scene(from url: URL) -> SCNScene {
-        let scene = SCNScene()
-        let points = PLYPointCloudLoader.load(url: url, maximumPointCount: 160_000)
-        let geometry = makeGeometry(points: points)
-        let node = SCNNode(geometry: geometry)
-        scene.rootNode.addChildNode(node)
-
-        let bounds = bounds(for: points)
-        let center = SCNVector3(
-            (bounds.min.x + bounds.max.x) * 0.5,
-            (bounds.min.y + bounds.max.y) * 0.5,
-            (bounds.min.z + bounds.max.z) * 0.5
-        )
-        node.position = SCNVector3(-center.x, -center.y, -center.z)
-
-        let span = max(bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z)
-        let cameraNode = SCNNode()
-        cameraNode.camera = SCNCamera()
-        cameraNode.camera?.zNear = 0.001
-        cameraNode.camera?.zFar = Double(max(span * 8, 20))
-        cameraNode.position = SCNVector3(0, 0, max(span * 1.8, 1.2))
-        scene.rootNode.addChildNode(cameraNode)
-
-        return scene
-    }
-
-    private static func makeGeometry(points: [PreviewPoint]) -> SCNGeometry {
-        let vertices = points.map { SCNVector3($0.x, $0.y, $0.z) }
-        let colors = points.flatMap { point in
-            [
-                Float(point.r) / 255,
-                Float(point.g) / 255,
-                Float(point.b) / 255,
-                Float(1)
-            ]
-        }
-
-        let vertexData = vertices.withUnsafeBufferPointer { buffer in
-            Data(buffer: buffer)
-        }
-        let colorData = colors.withUnsafeBufferPointer { buffer in
-            Data(buffer: buffer)
-        }
-
-        let vertexSource = SCNGeometrySource(
-            data: vertexData,
-            semantic: .vertex,
-            vectorCount: vertices.count,
-            usesFloatComponents: true,
-            componentsPerVector: 3,
-            bytesPerComponent: MemoryLayout<Float>.stride,
-            dataOffset: 0,
-            dataStride: MemoryLayout<SCNVector3>.stride
-        )
-        let colorSource = SCNGeometrySource(
-            data: colorData,
-            semantic: .color,
-            vectorCount: points.count,
-            usesFloatComponents: true,
-            componentsPerVector: 4,
-            bytesPerComponent: MemoryLayout<Float>.stride,
-            dataOffset: 0,
-            dataStride: MemoryLayout<Float>.stride * 4
-        )
-        let element = SCNGeometryElement(data: nil, primitiveType: .point, primitiveCount: points.count, bytesPerIndex: 0)
-        element.pointSize = 2
-        element.minimumPointScreenSpaceRadius = 1
-        element.maximumPointScreenSpaceRadius = 4
-
-        let geometry = SCNGeometry(sources: [vertexSource, colorSource], elements: [element])
-        let material = SCNMaterial()
-        material.lightingModel = .constant
-        material.isDoubleSided = true
-        geometry.materials = [material]
-        return geometry
-    }
-
-    private static func bounds(for points: [PreviewPoint]) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
-        guard let first = points.first else {
-            return (SIMD3<Float>(-0.5, -0.5, -0.5), SIMD3<Float>(0.5, 0.5, 0.5))
-        }
-
-        var minPoint = SIMD3<Float>(first.x, first.y, first.z)
-        var maxPoint = minPoint
-        for point in points.dropFirst() {
-            let value = SIMD3<Float>(point.x, point.y, point.z)
-            minPoint = simd_min(minPoint, value)
-            maxPoint = simd_max(maxPoint, value)
-        }
-        return (minPoint, maxPoint)
-    }
-}
-
-private enum PLYPointCloudLoader {
-    static func load(url: URL, maximumPointCount: Int) -> [PreviewPoint] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8),
-              let headerEnd = text.range(of: "end_header\n")?.upperBound else {
-            return []
-        }
-
-        let lines = text[headerEnd...].split(separator: "\n", omittingEmptySubsequences: true)
-        let stride = max(lines.count / maximumPointCount, 1)
-        return lines.enumerated().compactMap { index, line in
-            guard index.isMultiple(of: stride) else { return nil }
-            return PreviewPoint(line: line)
-        }
-    }
-}
-
-private struct PreviewPoint {
-    var x: Float
-    var y: Float
-    var z: Float
-    var r: UInt8
-    var g: UInt8
-    var b: UInt8
-
-    init?(line: Substring) {
-        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-        guard parts.count >= 6,
-              let x = Float(parts[0]),
-              let y = Float(parts[1]),
-              let z = Float(parts[2]),
-              let r = UInt8(parts[3]),
-              let g = UInt8(parts[4]),
-              let b = UInt8(parts[5]) else {
-            return nil
-        }
-
-        self.x = x
-        self.y = y
-        self.z = z
-        self.r = r
-        self.g = g
-        self.b = b
     }
 }
 
