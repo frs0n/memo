@@ -710,6 +710,11 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     private var gestureStartPanOffset = SIMD2<Float>(0, 0)
     private var gestureStartDistance: Float = 7
     private var autoRotates = true
+    private var revealAnimationStartDate: Date?
+    private var revealAnimationCenter = SIMD3<Float>.zero
+    private var revealAnimationRadius: Float = 1
+    private var rotationCenter = SIMD3<Float>.zero
+    private let revealAnimationDuration: TimeInterval = 3.2
 
     init?(view: MTKView) {
         guard let device = view.device,
@@ -739,11 +744,22 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
                     maxSimultaneousRenders: 3
                 )
                 let points = try await AutodetectSceneReader(url).readAll()
+                let revealBounds = Self.revealBounds(for: points)
                 let chunk = try SplatChunk(device: device, from: points)
                 await renderer.addChunk(chunk)
+                renderer.animation = .pointCloudReveal(
+                    center: revealBounds.center,
+                    radius: revealBounds.radius,
+                    progress: 0
+                )
+                revealAnimationCenter = revealBounds.center
+                revealAnimationRadius = revealBounds.radius
+                rotationCenter = revealBounds.center
+                revealAnimationStartDate = Date()
                 splatRenderer = renderer
             } catch {
                 splatRenderer = nil
+                revealAnimationStartDate = nil
             }
         }
     }
@@ -764,6 +780,7 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         }
 
         updateRotation()
+        updateRevealAnimation()
 
         let didRender: Bool
         do {
@@ -865,7 +882,8 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         )
         let viewMatrix = matrix4x4Translation(panOffset.x, panOffset.y, -distance) *
             matrix4x4Rotation(radians: pitch, axis: SIMD3<Float>(1, 0, 0)) *
-            matrix4x4Rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0))
+            matrix4x4Rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0)) *
+            matrix4x4Translation(-rotationCenter.x, -rotationCenter.y, -rotationCenter.z)
         let metalViewport = MTLViewport(
             originX: 0,
             originY: 0,
@@ -888,6 +906,36 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
             yaw += Float(now.timeIntervalSince(lastFrameDate)) * 0.22
         }
         lastFrameDate = now
+    }
+
+    private func updateRevealAnimation() {
+        guard let splatRenderer, let revealAnimationStartDate else { return }
+        let elapsed = Date().timeIntervalSince(revealAnimationStartDate)
+        let linearProgress = Float(min(max(elapsed / revealAnimationDuration, 0), 1))
+        let progress = easeInOutCubic(linearProgress)
+        splatRenderer.animation = .pointCloudReveal(
+            center: revealAnimationCenter,
+            radius: revealAnimationRadius,
+            progress: progress
+        )
+        if linearProgress >= 1 {
+            self.revealAnimationStartDate = nil
+        }
+    }
+
+    private func easeInOutCubic(_ value: Float) -> Float {
+        value < 0.5
+            ? 4 * value * value * value
+            : 1 - powf(-2 * value + 2, 3) / 2
+    }
+
+    private static func revealBounds(for points: [SplatPoint]) -> (center: SIMD3<Float>, radius: Float) {
+        guard !points.isEmpty else { return (.zero, 1) }
+        let center = points.reduce(SIMD3<Float>.zero) { $0 + $1.position } / Float(points.count)
+        let radius = points.reduce(Float(0)) { partial, point in
+            Swift.max(partial, simd_length(point.position - center))
+        }
+        return (center, Swift.max(radius, 0.1))
     }
 }
 

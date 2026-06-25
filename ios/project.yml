@@ -34,8 +34,7 @@ packages:
   Msplat:
     path: ../msplat/swift
   MetalSplatter:
-    url: https://github.com/scier/MetalSplatter.git
-    from: 1.0.1
+    path: ../MetalSplatter
 
 targets:
   memo:
