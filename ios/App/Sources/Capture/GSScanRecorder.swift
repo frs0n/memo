@@ -29,6 +29,8 @@ final class GSScanRecorder {
     private let candidateWindowSize = 8
     private let depthSampleStride = 3
     private let maximumPointCount = 700_000
+    private let pointVoxelSize: Float = 0.012
+    private let minimumConsistentDepthNeighbors = 2
 
     private var rootURL: URL?
     private var imagesURL: URL?
@@ -38,6 +40,7 @@ final class GSScanRecorder {
     private var camerasText = "# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
     private var imagesText = "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n# POINTS2D[] as X, Y, POINT3D_ID\n"
     private var points: [PLYPoint] = []
+    private var pointVoxels: [PointVoxelKey: PointVoxelAccumulator] = [:]
     private var candidateWindow: [KeyframeCandidate] = []
     private var lastKeyframePosition: SIMD3<Float>?
     private var frameIndex = 0
@@ -73,6 +76,7 @@ final class GSScanRecorder {
         camerasText = "# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
         imagesText = "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n# POINTS2D[] as X, Y, POINT3D_ID\n"
         points.removeAll(keepingCapacity: true)
+        pointVoxels.removeAll(keepingCapacity: true)
         candidateWindow.removeAll(keepingCapacity: true)
         lastKeyframePosition = nil
         frameIndex = 0
@@ -95,7 +99,7 @@ final class GSScanRecorder {
         let quality = measureFrameQuality(frame)
         appendFrameMetadata(frame, quality: quality)
 
-        if let lastKeyframePosition {
+        if lastKeyframePosition != nil {
             guard quality.displacement >= minimumDisplacement else {
                 return CaptureIngestResult(didAcceptKeyframe: false, statusText: "Move for parallax")
             }
@@ -134,6 +138,7 @@ final class GSScanRecorder {
 
         try framesLog?.close()
         framesLog = nil
+        points = fusedPointCloud()
 
         try camerasText.write(to: sparseURL.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
         try imagesText.write(to: sparseURL.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
@@ -308,9 +313,36 @@ final class GSScanRecorder {
     }
 
     private func appendDepthPoints(_ newPoints: [PLYPoint]) {
-        guard points.count < maximumPointCount else { return }
-        let remaining = maximumPointCount - points.count
-        points.append(contentsOf: newPoints.prefix(remaining))
+        guard pointVoxels.count < maximumPointCount else { return }
+
+        for point in newPoints {
+            let key = PointVoxelKey(point: point, voxelSize: pointVoxelSize)
+            if var accumulator = pointVoxels[key] {
+                accumulator.add(point)
+                pointVoxels[key] = accumulator
+            } else if pointVoxels.count < maximumPointCount {
+                pointVoxels[key] = PointVoxelAccumulator(point)
+            } else {
+                break
+            }
+        }
+    }
+
+    private func fusedPointCloud() -> [PLYPoint] {
+        let observedMoreThanOnce = pointVoxels.values.filter { $0.observationCount > 1 }
+        let source = observedMoreThanOnce.count >= max(keyframeCount * 1_000, 12_000)
+            ? observedMoreThanOnce
+            : Array(pointVoxels.values)
+
+        return source
+            .sorted {
+                if $0.observationCount != $1.observationCount {
+                    return $0.observationCount > $1.observationCount
+                }
+                return $0.sortKey < $1.sortKey
+            }
+            .prefix(maximumPointCount)
+            .map { $0.point }
     }
 
     private func measureFrameQuality(_ frame: ARFrame) -> FrameQuality {
@@ -429,6 +461,21 @@ final class GSScanRecorder {
 
                 let depth = depthBase[y * depthStride + x]
                 if !depth.isFinite || depth <= 0.05 || depth > 8.0 { continue }
+                guard Self.hasConsistentDepthNeighborhood(
+                    x: x,
+                    y: y,
+                    depth: depth,
+                    depthBase: depthBase,
+                    depthWidth: depthWidth,
+                    depthHeight: depthHeight,
+                    depthStride: depthStride,
+                    confidenceBase: confidenceBase,
+                    confidenceStride: confidenceStride,
+                    sampleStride: depthSampleStride,
+                    minimumNeighbors: minimumConsistentDepthNeighbors
+                ) else {
+                    continue
+                }
                 validSamples += 1
                 if confidence >= 2 {
                     highConfidenceSamples += 1
@@ -454,7 +501,7 @@ final class GSScanRecorder {
     }
 
     private func writePLY(to url: URL) throws {
-        var text = """
+        let header = """
         ply
         format ascii 1.0
         element vertex \(points.count)
@@ -467,10 +514,15 @@ final class GSScanRecorder {
         end_header
 
         """
+        try Data(header.utf8).write(to: url, options: .atomic)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        defer { try? handle.close() }
+
         for point in points {
-            text += "\(point.x) \(point.y) \(point.z) \(point.r) \(point.g) \(point.b)\n"
+            let line = "\(point.x) \(point.y) \(point.z) \(point.r) \(point.g) \(point.b)\n"
+            try handle.write(contentsOf: Data(line.utf8))
         }
-        try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func writeManifest(to url: URL) throws {
@@ -489,18 +541,65 @@ final class GSScanRecorder {
                 candidateWindowSize: candidateWindowSize,
                 ranking: "highest sparse-luma gradient sharpness in each eligible window",
                 lidarConfidence: "medium-or-high",
-                maximumDepthMeters: 8
+                maximumDepthMeters: 8,
+                pointVoxelSizeMeters: pointVoxelSize,
+                depthConsistency: "requires two locally consistent depth neighbors before voxel fusion"
             ),
             layout: [
                 "images/*.jpg": "RGB accepted keyframes",
                 "arkit/frames.jsonl": "Per ARFrame pose, intrinsics, tracking state, and accepted-keyframe markers",
                 "sparse/0/cameras.txt": "COLMAP text cameras, one PINHOLE entry per accepted keyframe",
                 "sparse/0/images.txt": "COLMAP text camera poses for accepted keyframes",
-                "depth/fused_points.ply": "Fused LiDAR points with XYZ and RGB"
+                "depth/fused_points.ply": "Voxel-fused, locally depth-consistent LiDAR points with XYZ and RGB"
             ]
         )
         let data = try JSONEncoder.capture.encode(manifest)
         try data.write(to: url, options: .atomic)
+    }
+
+    private static func hasConsistentDepthNeighborhood(
+        x: Int,
+        y: Int,
+        depth: Float,
+        depthBase: UnsafePointer<Float32>,
+        depthWidth: Int,
+        depthHeight: Int,
+        depthStride: Int,
+        confidenceBase: UnsafePointer<UInt8>?,
+        confidenceStride: Int,
+        sampleStride: Int,
+        minimumNeighbors: Int
+    ) -> Bool {
+        let tolerance = max(0.035, depth * 0.025)
+        let offsets = [
+            (-sampleStride, 0),
+            (sampleStride, 0),
+            (0, -sampleStride),
+            (0, sampleStride)
+        ]
+        var consistentNeighbors = 0
+
+        for offset in offsets {
+            let nx = x + offset.0
+            let ny = y + offset.1
+            guard nx >= 0, nx < depthWidth, ny >= 0, ny < depthHeight else { continue }
+
+            let confidence = confidenceBase.map { $0[ny * confidenceStride + nx] } ?? 2
+            if confidence < 1 { continue }
+
+            let neighborDepth = depthBase[ny * depthStride + nx]
+            if neighborDepth.isFinite,
+               neighborDepth > 0.05,
+               neighborDepth <= 8.0,
+               abs(neighborDepth - depth) <= tolerance {
+                consistentNeighbors += 1
+                if consistentNeighbors >= minimumNeighbors {
+                    return true
+                }
+            }
+        }
+
+        return false
     }
 
     private static func gradientSharpness(_ pixelBuffer: CVPixelBuffer) -> Double {
@@ -569,6 +668,60 @@ private struct PLYPoint {
     var r: UInt8
     var g: UInt8
     var b: UInt8
+}
+
+private struct PointVoxelKey: Hashable {
+    var x: Int
+    var y: Int
+    var z: Int
+
+    init(point: PLYPoint, voxelSize: Float) {
+        x = Int(floor(point.x / voxelSize))
+        y = Int(floor(point.y / voxelSize))
+        z = Int(floor(point.z / voxelSize))
+    }
+}
+
+private struct PointVoxelAccumulator {
+    private var sum = SIMD3<Float>(repeating: 0)
+    private var redSum = 0
+    private var greenSum = 0
+    private var blueSum = 0
+    private(set) var observationCount = 0
+    let sortKey: Int
+
+    init(_ point: PLYPoint) {
+        sortKey = Self.makeSortKey(point)
+        add(point)
+    }
+
+    mutating func add(_ point: PLYPoint) {
+        sum += SIMD3<Float>(point.x, point.y, point.z)
+        redSum += Int(point.r)
+        greenSum += Int(point.g)
+        blueSum += Int(point.b)
+        observationCount += 1
+    }
+
+    var point: PLYPoint {
+        let invCount = 1 / Float(max(observationCount, 1))
+        let rgbDivisor = max(observationCount, 1)
+        return PLYPoint(
+            x: sum.x * invCount,
+            y: sum.y * invCount,
+            z: sum.z * invCount,
+            r: UInt8(clamping: redSum / rgbDivisor),
+            g: UInt8(clamping: greenSum / rgbDivisor),
+            b: UInt8(clamping: blueSum / rgbDivisor)
+        )
+    }
+
+    private static func makeSortKey(_ point: PLYPoint) -> Int {
+        let x = Int((point.x * 10_000).rounded())
+        let y = Int((point.y * 10_000).rounded())
+        let z = Int((point.z * 10_000).rounded())
+        return x &* 73_856_093 ^ y &* 19_349_663 ^ z &* 83_492_791
+    }
 }
 
 private struct DepthStats {
@@ -647,6 +800,8 @@ private struct CaptureQualityGates: Encodable {
     var ranking: String
     var lidarConfidence: String
     var maximumDepthMeters: Float
+    var pointVoxelSizeMeters: Float
+    var depthConsistency: String
 }
 
 private enum CaptureSessionError: Error {
