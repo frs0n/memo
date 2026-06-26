@@ -32,6 +32,23 @@ extension MemoScanRecord {
         packageURL.appendingPathComponent("thumbnail.jpg")
     }
 
+    var capturedImagesURL: URL {
+        packageURL.appendingPathComponent("images", isDirectory: true)
+    }
+
+    var capturedImageURLs: [URL] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: capturedImagesURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        return urls
+            .filter { $0.pathExtension.lowercased() == "jpg" || $0.pathExtension.lowercased() == "jpeg" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
     var gaussianSplatURL: URL {
         packageURL.appendingPathComponent("trained.splat")
     }
