@@ -826,7 +826,7 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     private var yaw: Float = 0
     private var pitch: Float = 0
     private var panOffset = SIMD2<Float>(0, 0)
-    private var distance: Float = 7
+    private var distance: Float = 3
     private var gestureStartYaw: Float = 0
     private var gestureStartPitch: Float = 0
     private var gestureStartPanOffset = SIMD2<Float>(0, 0)
