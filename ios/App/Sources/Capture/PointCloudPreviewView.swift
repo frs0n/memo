@@ -359,8 +359,10 @@ private final class ScanTrainingController: ObservableObject, @unchecked Sendabl
             _ = try store.markTrained(scan, iterations: trainingMode.preset.iterations)
             iteration = trainingMode.preset.iterations
             previewImage = nil
-            previewGaussianFileURL = gaussianFileURL
-            previewReloadToken += 1
+            if previewGaussianFileURL != gaussianFileURL {
+                previewGaussianFileURL = gaussianFileURL
+                previewReloadToken += 1
+            }
             phase = .rendering(gaussianFileURL)
             task = nil
         } catch {
@@ -778,7 +780,6 @@ private struct GaussianSplatView: UIViewRepresentable {
         if let renderer = GaussianSplatRenderer(view: view) {
             context.coordinator.renderer = renderer
             view.delegate = renderer
-            renderer.load(url: gaussianFileURL)
         }
 
         return view
