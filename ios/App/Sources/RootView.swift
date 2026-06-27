@@ -49,6 +49,7 @@ struct RootView: View {
                 }
 
                 AddScanButton {
+                    triggerAddHaptic()
                     isCapturing = true
                 }
                 .padding(.bottom, 18)
@@ -123,6 +124,12 @@ struct RootView: View {
             store.delete(scan)
             scanPendingDeletion = nil
         }
+    }
+
+    private func triggerAddHaptic() {
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred()
     }
 }
 
