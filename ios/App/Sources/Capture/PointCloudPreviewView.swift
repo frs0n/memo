@@ -263,7 +263,7 @@ private struct CapturedImageDetailView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                Color.black
+                Color(.systemBackground)
                     .ignoresSafeArea()
 
                 if let image = UIImage(contentsOfFile: url.path) {
@@ -273,7 +273,6 @@ private struct CapturedImageDetailView: View {
                         .ignoresSafeArea()
                 } else {
                     ContentUnavailableView("Image missing", systemImage: "photo")
-                        .foregroundStyle(.white)
                 }
             }
             .navigationTitle(url.deletingPathExtension().lastPathComponent)
@@ -893,7 +892,7 @@ private struct PreviewPlaceholder: View {
 
     var body: some View {
         ZStack {
-            Color.black
+            Color(.systemBackground)
 
             if let image = UIImage(contentsOfFile: thumbnailURL.path) {
                 Image(uiImage: image)
@@ -913,7 +912,7 @@ private struct TrainingImagePreview: View {
 
     var body: some View {
         ZStack {
-            Color.black
+            Color(.systemBackground)
 
             Image(uiImage: image)
                 .resizable()
