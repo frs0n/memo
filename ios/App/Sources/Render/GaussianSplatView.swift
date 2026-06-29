@@ -63,17 +63,21 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     private var loadedURL: URL?
     private var drawableSize: CGSize = .zero
     private var lastFrameDate = Date()
-    private var yaw: Float = 0
-    private var pitch: Float = 0
-    private var panOffset = SIMD2<Float>(0, 0)
-    private var distance: Float = 3
-    private var dronePosition = SIMD3<Float>.zero
+    private var targetYaw: Float = 0
+    private var targetPitch: Float = 0
+    private var targetPanOffset = SIMD2<Float>(0, 0)
+    private var targetDistance: Float = 3
+    private var targetDronePosition = SIMD3<Float>.zero
+    private var renderedYaw: Float = 0
+    private var renderedPitch: Float = 0
+    private var renderedPanOffset = SIMD2<Float>(0, 0)
+    private var renderedDistance: Float = 3
+    private var renderedDronePosition = SIMD3<Float>.zero
     private var droneControlVector = SIMD2<Float>.zero
     private var isDroneModeEnabled = false
     private var gestureStartYaw: Float = 0
     private var gestureStartPitch: Float = 0
     private var gestureStartPanOffset = SIMD2<Float>(0, 0)
-    private var gestureStartDistance: Float = 7
     private var autoRotates = true
     private var revealAnimationStartDate: Date?
     private var revealAnimationCenter = SIMD3<Float>.zero
@@ -96,8 +100,11 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     func configureDroneMode(isEnabled: Bool, controlVector: SIMD2<Float>) {
         if isDroneModeEnabled != isEnabled, isEnabled {
             autoRotates = false
-            dronePosition = orbitCameraOffset
-            panOffset = .zero
+            let offset = orbitCameraOffset
+            targetDronePosition = offset
+            renderedDronePosition = offset
+            targetPanOffset = .zero
+            renderedPanOffset = .zero
         }
         isDroneModeEnabled = isEnabled
         droneControlVector = isEnabled ? controlVector : .zero
@@ -130,7 +137,8 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
                 revealAnimationCenter = revealBounds.center
                 revealAnimationRadius = revealBounds.radius
                 rotationCenter = revealBounds.center
-                dronePosition = .zero
+                targetDronePosition = .zero
+                renderedDronePosition = .zero
                 revealAnimationStartDate = Date()
                 splatRenderer = renderer
             } catch {
@@ -207,12 +215,12 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         switch gesture.state {
         case .began:
             autoRotates = false
-            gestureStartYaw = yaw
-            gestureStartPitch = pitch
+            gestureStartYaw = targetYaw
+            gestureStartPitch = targetPitch
         case .changed:
             let translation = gesture.translation(in: view)
-            yaw = gestureStartYaw + Float(translation.x) * 0.008
-            pitch = clamp(gestureStartPitch + Float(translation.y) * 0.008, min: -.pi * 0.48, max: .pi * 0.48)
+            targetYaw = gestureStartYaw + Float(translation.x) * 0.008
+            targetPitch = clamp(gestureStartPitch + Float(translation.y) * 0.008, min: -.pi * 0.48, max: .pi * 0.48)
         default:
             break
         }
@@ -222,11 +230,11 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         switch gesture.state {
         case .began:
             autoRotates = false
-            gestureStartPanOffset = panOffset
+            gestureStartPanOffset = targetPanOffset
         case .changed:
             let translation = gesture.translation(in: view)
-            let scale = distance * 0.0014
-            panOffset = gestureStartPanOffset + SIMD2<Float>(
+            let scale = targetDistance * 0.0014
+            targetPanOffset = gestureStartPanOffset + SIMD2<Float>(
                 Float(translation.x) * scale,
                 -Float(translation.y) * scale
             )
@@ -239,9 +247,13 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         switch gesture.state {
         case .began:
             autoRotates = false
-            gestureStartDistance = distance
+            gesture.scale = 1
         case .changed:
-            distance = clamp(gestureStartDistance / Float(gesture.scale), min: 1.2, max: 30)
+            let scale = Float(gesture.scale)
+            guard scale > 0 else { return }
+            let sensitivity = zoomSensitivity(for: targetDistance)
+            targetDistance = max(targetDistance * powf(scale, -sensitivity), minimumInteractiveDistance)
+            gesture.scale = 1
         default:
             break
         }
@@ -253,8 +265,8 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         let projection = matrixPerspectiveRightHand(
             fovyRadians: Float(Angle(degrees: 62).radians),
             aspectRatio: Float(width / height),
-            nearZ: 0.1,
-            farZ: 100
+            nearZ: max(renderedDistance * 0.001, 0.0001),
+            farZ: max(100, renderedDistance + revealAnimationRadius * 4)
         )
         let viewMatrix = isDroneModeEnabled ? droneViewMatrix : orbitViewMatrix
         let metalViewport = MTLViewport(
@@ -274,26 +286,26 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     }
 
     private var orbitViewMatrix: simd_float4x4 {
-        matrix4x4Translation(panOffset.x, panOffset.y, -distance) *
+        matrix4x4Translation(renderedPanOffset.x, renderedPanOffset.y, -renderedDistance) *
             cameraRotationMatrix *
             matrix4x4Translation(-rotationCenter.x, -rotationCenter.y, -rotationCenter.z)
     }
 
     private var droneViewMatrix: simd_float4x4 {
-        let cameraPosition = rotationCenter + dronePosition
+        let cameraPosition = rotationCenter + renderedDronePosition
         return cameraRotationMatrix *
             matrix4x4Translation(-cameraPosition.x, -cameraPosition.y, -cameraPosition.z)
     }
 
     private var cameraRotationMatrix: simd_float4x4 {
-        matrix4x4Rotation(radians: pitch, axis: SIMD3<Float>(1, 0, 0)) *
-            matrix4x4Rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0))
+        matrix4x4Rotation(radians: renderedPitch, axis: SIMD3<Float>(1, 0, 0)) *
+            matrix4x4Rotation(radians: renderedYaw, axis: SIMD3<Float>(0, 1, 0))
     }
 
     private var orbitCameraOffset: SIMD3<Float> {
-        let inverseRotation = matrix4x4Rotation(radians: -yaw, axis: SIMD3<Float>(0, 1, 0)) *
-            matrix4x4Rotation(radians: -pitch, axis: SIMD3<Float>(1, 0, 0))
-        let offset = inverseRotation * SIMD4<Float>(0, 0, distance, 0)
+        let inverseRotation = matrix4x4Rotation(radians: -targetYaw, axis: SIMD3<Float>(0, 1, 0)) *
+            matrix4x4Rotation(radians: -targetPitch, axis: SIMD3<Float>(1, 0, 0))
+        let offset = inverseRotation * SIMD4<Float>(0, 0, targetDistance, 0)
         return SIMD3<Float>(offset.x, offset.y, offset.z)
     }
 
@@ -301,12 +313,33 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         let now = Date()
         let deltaTime = Float(now.timeIntervalSince(lastFrameDate))
         if autoRotates {
-            yaw += deltaTime * 0.22
+            targetYaw += deltaTime * 0.22
         }
         if isDroneModeEnabled {
             updateDroneFlight(deltaTime: deltaTime)
         }
+        smoothCameraState(deltaTime: deltaTime)
         lastFrameDate = now
+    }
+
+    private func smoothCameraState(deltaTime: Float) {
+        let factor = smoothingFactor(deltaTime: deltaTime, response: 16)
+        renderedYaw = lerp(renderedYaw, targetYaw, factor)
+        renderedPitch = lerp(renderedPitch, targetPitch, factor)
+        renderedPanOffset = simd_mix(renderedPanOffset, targetPanOffset, SIMD2<Float>(repeating: factor))
+        renderedDistance = lerp(renderedDistance, targetDistance, factor)
+        renderedDronePosition = simd_mix(renderedDronePosition, targetDronePosition, SIMD3<Float>(repeating: factor))
+    }
+
+    private var minimumInteractiveDistance: Float {
+        max(revealAnimationRadius * 0.000001, Float.ulpOfOne)
+    }
+
+    private func zoomSensitivity(for distance: Float) -> Float {
+        let sceneScale = max(revealAnimationRadius, 0.1)
+        let normalizedDistance = max(distance / sceneScale, 0.000001)
+        let distanceFromSceneScale = abs(logf(normalizedDistance))
+        return clamp(0.9 / (1 + distanceFromSceneScale * 0.65), min: 0.08, max: 0.9)
     }
 
     private func updateDroneFlight(deltaTime: Float) {
@@ -318,13 +351,13 @@ final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
 
         let speed = Swift.max(revealAnimationRadius, 0.8) * 0.72
         let forward = normalize(SIMD3<Float>(
-            -sinf(yaw) * cosf(pitch),
-            sinf(pitch),
-            cosf(yaw) * cosf(pitch)
+            -sinf(targetYaw) * cosf(targetPitch),
+            sinf(targetPitch),
+            cosf(targetYaw) * cosf(targetPitch)
         ))
         let right = normalize(simd_cross(SIMD3<Float>(0, 1, 0), forward))
         let movement = right * input.x + forward * input.y
-        dronePosition += movement * speed * deltaTime
+        targetDronePosition += movement * speed * deltaTime
     }
 
     private func updateRevealAnimation() {
@@ -411,4 +444,13 @@ private func matrixPerspectiveRightHand(
 
 private func clamp(_ value: Float, min minimum: Float, max maximum: Float) -> Float {
     Swift.min(Swift.max(value, minimum), maximum)
+}
+
+private func lerp(_ start: Float, _ end: Float, _ factor: Float) -> Float {
+    start + (end - start) * factor
+}
+
+private func smoothingFactor(deltaTime: Float, response: Float) -> Float {
+    let clampedDeltaTime = clamp(deltaTime, min: 0, max: 1 / 15)
+    return 1 - expf(-response * clampedDeltaTime)
 }
