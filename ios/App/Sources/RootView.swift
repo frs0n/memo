@@ -139,7 +139,7 @@ private struct ScanDestinationView: View {
 
     var body: some View {
         if let scan = store.record(id: scanID) {
-            PointCloudPreviewView(scan: scan, store: store)
+            ScanDetailView(scan: scan, store: store)
         } else {
             ContentUnavailableView("Scan missing", systemImage: "exclamationmark.triangle")
         }
