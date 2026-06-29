@@ -17,6 +17,8 @@ struct PointCloudPreviewView: View {
     @State private var shareSheet: SharedFileSheetItem?
     @State private var shareError: String?
     @State private var isShowingCapturedImages = false
+    @State private var isDroneModeEnabled = false
+    @State private var droneControlVector = CGSize.zero
 
     init(scan: MemoScanRecord, store: MemoScanStore) {
         self.scan = scan
@@ -25,36 +27,11 @@ struct PointCloudPreviewView: View {
     }
 
     var body: some View {
-        ZStack {
-            Color(.systemBackground)
-                .ignoresSafeArea()
-
-            if let previewImage = trainer.previewImage {
-                TrainingImagePreview(image: previewImage)
-                    .ignoresSafeArea()
-            } else if let gaussianFileURL = trainer.previewGaussianFileURL {
-                GaussianSplatView(
-                    gaussianFileURL: gaussianFileURL,
-                    reloadToken: trainer.previewReloadToken
-                )
-                .ignoresSafeArea()
-            } else {
-                PreviewPlaceholder(thumbnailURL: scan.thumbnailURL)
-                    .ignoresSafeArea()
-            }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            TrainingBottomBar(
-                phase: trainer.phase,
-                iteration: trainer.iteration,
-                totalIterations: trainer.totalIterations,
-                splatCount: trainer.splatCount,
-                errorMessage: trainer.errorMessage,
-                mode: Binding(
-                    get: { trainer.trainingMode },
-                    set: { trainer.trainingMode = $0 }
-                ),
-                action: { trainer.start(scan: scan) }
+        GeometryReader { proxy in
+            previewLayout(
+                usesLeadingDroneControl: proxy.size.width > proxy.size.height &&
+                    trainer.phase.isRendering &&
+                    isDroneModeEnabled
             )
         }
         .navigationTitle(trainer.navigationTitle)
@@ -72,6 +49,21 @@ struct PointCloudPreviewView: View {
             }
 
             if trainer.phase.isRendering {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        withAnimation(.snappy(duration: 0.2)) {
+                            isDroneModeEnabled.toggle()
+                            if !isDroneModeEnabled {
+                                droneControlVector = .zero
+                            }
+                        }
+                    } label: {
+                        Image(systemName: isDroneModeEnabled ? "l.joystick.fill" : "l.joystick")
+                    }
+                    .accessibilityLabel(isDroneModeEnabled ? "Exit drone mode" : "Enter drone mode")
+                    .accessibilityAddTraits(isDroneModeEnabled ? .isSelected : [])
+                }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         shareGaussianSplat()
@@ -107,6 +99,66 @@ struct PointCloudPreviewView: View {
         .onDisappear {
             trainer.cancel(scan: scan)
         }
+        .onChange(of: trainer.phase.isRendering) { _, isRendering in
+            if !isRendering {
+                isDroneModeEnabled = false
+                droneControlVector = .zero
+            }
+        }
+    }
+
+    private func previewLayout(usesLeadingDroneControl: Bool) -> some View {
+        ZStack {
+            previewSurface
+
+            bottomBar(usesLeadingDroneControl: usesLeadingDroneControl)
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: usesLeadingDroneControl ? .leading : .bottom
+                )
+        }
+    }
+
+    private var previewSurface: some View {
+        ZStack {
+            Color(.systemBackground)
+                .ignoresSafeArea()
+
+            if let previewImage = trainer.previewImage {
+                TrainingImagePreview(image: previewImage)
+                    .ignoresSafeArea()
+            } else if let gaussianFileURL = trainer.previewGaussianFileURL {
+                GaussianSplatView(
+                    gaussianFileURL: gaussianFileURL,
+                    reloadToken: trainer.previewReloadToken,
+                    isDroneModeEnabled: isDroneModeEnabled,
+                    droneControlVector: droneControlVector
+                )
+                .ignoresSafeArea()
+            } else {
+                PreviewPlaceholder(thumbnailURL: scan.thumbnailURL)
+                    .ignoresSafeArea()
+            }
+        }
+    }
+
+    private func bottomBar(usesLeadingDroneControl: Bool) -> some View {
+        TrainingBottomBar(
+            phase: trainer.phase,
+            iteration: trainer.iteration,
+            totalIterations: trainer.totalIterations,
+            splatCount: trainer.splatCount,
+            errorMessage: trainer.errorMessage,
+            mode: Binding(
+                get: { trainer.trainingMode },
+                set: { trainer.trainingMode = $0 }
+            ),
+            isDroneModeEnabled: isDroneModeEnabled,
+            isLeadingDroneControl: usesLeadingDroneControl,
+            droneControlVector: $droneControlVector,
+            action: { trainer.start(scan: scan) }
+        )
     }
 
     private var shareErrorBinding: Binding<Bool> {
@@ -598,9 +650,29 @@ private struct TrainingBottomBar: View {
     let splatCount: Int
     let errorMessage: String?
     @Binding var mode: ScanTrainingMode
+    let isDroneModeEnabled: Bool
+    let isLeadingDroneControl: Bool
+    @Binding var droneControlVector: CGSize
     let action: () -> Void
 
     var body: some View {
+        if isLeadingDroneControl {
+            content
+                .padding(.horizontal, 16)
+                .padding(.top, 140)
+                .padding(.bottom, 16)
+                .frame(width: 148)
+                .frame(maxHeight: .infinity, alignment: .center)
+        } else {
+            content
+                .padding(.horizontal, 24)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             switch phase {
             case .idle:
@@ -613,7 +685,11 @@ private struct TrainingBottomBar: View {
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Training iteration \(iteration) of \(totalIterations)")
             case .rendering:
-                EmptyView()
+                if isDroneModeEnabled {
+                    DroneRemoteControl(vector: $droneControlVector)
+                        .transition(.move(edge: isLeadingDroneControl ? .leading : .bottom).combined(with: .opacity))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
             case .failed:
                 VStack(alignment: .leading, spacing: 8) {
                     Text(errorMessage ?? "Training failed")
@@ -625,10 +701,97 @@ private struct TrainingBottomBar: View {
                 }
             }
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct DroneRemoteControl: View {
+    @Binding var vector: CGSize
+
+    private let controlSize: CGFloat = 108
+    private let thumbSize: CGFloat = 42
+
+    var body: some View {
+        VStack {
+            controlSurface
+            .frame(width: controlSize, height: controlSize)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        vector = clampedControlVector(value.translation)
+                    }
+                    .onEnded { _ in
+                        withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                            vector = .zero
+                        }
+                    }
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Drone remote control")
+            .accessibilityValue(accessibilityValue)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    @ViewBuilder
+    private var controlSurface: some View {
+        if #available(iOS 26.0, *) {
+            ZStack {
+                GlassEffectContainer(spacing: 0) {
+                    ZStack {
+                        Circle()
+                            .fill(.secondary.opacity(0.04))
+                            .glassEffect(.regular.tint(.primary.opacity(0.08)).interactive(), in: .circle)
+
+                        Circle()
+                            .fill(.secondary.opacity(0.06))
+                            .frame(width: controlSize * 0.46, height: controlSize * 0.46)
+                            .glassEffect(.regular.tint(.secondary.opacity(0.12)), in: .circle)
+                    }
+                }
+
+                Circle()
+                    .fill(Color(uiColor: .black))
+                    .frame(width: thumbSize, height: thumbSize)
+                    .offset(vector)
+            }
+        } else {
+            ZStack {
+                Circle()
+                    .fill(.ultraThinMaterial)
+                    .overlay {
+                        Circle()
+                            .strokeBorder(.secondary.opacity(0.22), lineWidth: 1)
+                    }
+
+                Circle()
+                    .fill(.secondary.opacity(0.12))
+                    .frame(width: controlSize * 0.44, height: controlSize * 0.44)
+
+                Circle()
+                    .fill(.primary.opacity(0.86))
+                    .frame(width: thumbSize, height: thumbSize)
+                    .offset(vector)
+            }
+        }
+    }
+
+    private var accessibilityValue: String {
+        guard vector != .zero else { return "Centered" }
+        let vertical = vector.height < 0 ? "forward" : "backward"
+        let horizontal = vector.width < 0 ? "left" : "right"
+        if abs(vector.height) > abs(vector.width) {
+            return vertical
+        }
+        return horizontal
+    }
+
+    private func clampedControlVector(_ translation: CGSize) -> CGSize {
+        let radius = (controlSize - thumbSize) * 0.5
+        let length = sqrt(translation.width * translation.width + translation.height * translation.height)
+        guard length > radius else { return translation }
+        let scale = radius / length
+        return CGSize(width: translation.width * scale, height: translation.height * scale)
     }
 }
 
@@ -763,6 +926,8 @@ private struct TrainingImagePreview: View {
 private struct GaussianSplatView: UIViewRepresentable {
     let gaussianFileURL: URL
     let reloadToken: Int
+    let isDroneModeEnabled: Bool
+    let droneControlVector: CGSize
 
     func makeCoordinator() -> GaussianSplatRendererCoordinator {
         GaussianSplatRendererCoordinator()
@@ -786,6 +951,13 @@ private struct GaussianSplatView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: MTKView, context: Context) {
+        context.coordinator.renderer?.configureDroneMode(
+            isEnabled: isDroneModeEnabled,
+            controlVector: SIMD2<Float>(
+                Float(droneControlVector.width / 33),
+                Float(droneControlVector.height / 33)
+            )
+        )
         context.coordinator.renderer?.load(url: gaussianFileURL, force: context.coordinator.reloadToken != reloadToken)
         context.coordinator.reloadToken = reloadToken
     }
@@ -828,6 +1000,9 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
     private var pitch: Float = 0
     private var panOffset = SIMD2<Float>(0, 0)
     private var distance: Float = 3
+    private var dronePosition = SIMD3<Float>.zero
+    private var droneControlVector = SIMD2<Float>.zero
+    private var isDroneModeEnabled = false
     private var gestureStartYaw: Float = 0
     private var gestureStartPitch: Float = 0
     private var gestureStartPanOffset = SIMD2<Float>(0, 0)
@@ -849,6 +1024,16 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         self.commandQueue = commandQueue
         super.init()
         configureGestures()
+    }
+
+    func configureDroneMode(isEnabled: Bool, controlVector: SIMD2<Float>) {
+        if isDroneModeEnabled != isEnabled, isEnabled {
+            autoRotates = false
+            dronePosition = orbitCameraOffset
+            panOffset = .zero
+        }
+        isDroneModeEnabled = isEnabled
+        droneControlVector = isEnabled ? controlVector : .zero
     }
 
     func load(url: URL, force: Bool = false) {
@@ -878,6 +1063,7 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
                 revealAnimationCenter = revealBounds.center
                 revealAnimationRadius = revealBounds.radius
                 rotationCenter = revealBounds.center
+                dronePosition = .zero
                 revealAnimationStartDate = Date()
                 splatRenderer = renderer
             } catch {
@@ -902,7 +1088,7 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
             semaphore.signal()
         }
 
-        updateRotation()
+        updateCameraMotion()
         updateRevealAnimation()
 
         let didRender: Bool
@@ -1003,10 +1189,7 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
             nearZ: 0.1,
             farZ: 100
         )
-        let viewMatrix = matrix4x4Translation(panOffset.x, panOffset.y, -distance) *
-            matrix4x4Rotation(radians: pitch, axis: SIMD3<Float>(1, 0, 0)) *
-            matrix4x4Rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0)) *
-            matrix4x4Translation(-rotationCenter.x, -rotationCenter.y, -rotationCenter.z)
+        let viewMatrix = isDroneModeEnabled ? droneViewMatrix : orbitViewMatrix
         let metalViewport = MTLViewport(
             originX: 0,
             originY: 0,
@@ -1023,12 +1206,58 @@ private final class GaussianSplatRenderer: NSObject, MTKViewDelegate {
         )
     }
 
-    private func updateRotation() {
+    private var orbitViewMatrix: simd_float4x4 {
+        matrix4x4Translation(panOffset.x, panOffset.y, -distance) *
+            cameraRotationMatrix *
+            matrix4x4Translation(-rotationCenter.x, -rotationCenter.y, -rotationCenter.z)
+    }
+
+    private var droneViewMatrix: simd_float4x4 {
+        let cameraPosition = rotationCenter + dronePosition
+        return cameraRotationMatrix *
+            matrix4x4Translation(-cameraPosition.x, -cameraPosition.y, -cameraPosition.z)
+    }
+
+    private var cameraRotationMatrix: simd_float4x4 {
+        matrix4x4Rotation(radians: pitch, axis: SIMD3<Float>(1, 0, 0)) *
+            matrix4x4Rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0))
+    }
+
+    private var orbitCameraOffset: SIMD3<Float> {
+        let inverseRotation = matrix4x4Rotation(radians: -yaw, axis: SIMD3<Float>(0, 1, 0)) *
+            matrix4x4Rotation(radians: -pitch, axis: SIMD3<Float>(1, 0, 0))
+        let offset = inverseRotation * SIMD4<Float>(0, 0, distance, 0)
+        return SIMD3<Float>(offset.x, offset.y, offset.z)
+    }
+
+    private func updateCameraMotion() {
         let now = Date()
+        let deltaTime = Float(now.timeIntervalSince(lastFrameDate))
         if autoRotates {
-            yaw += Float(now.timeIntervalSince(lastFrameDate)) * 0.22
+            yaw += deltaTime * 0.22
+        }
+        if isDroneModeEnabled {
+            updateDroneFlight(deltaTime: deltaTime)
         }
         lastFrameDate = now
+    }
+
+    private func updateDroneFlight(deltaTime: Float) {
+        let input = SIMD2<Float>(
+            clamp(droneControlVector.x, min: -1, max: 1),
+            clamp(droneControlVector.y, min: -1, max: 1)
+        )
+        guard simd_length(input) > 0.02 else { return }
+
+        let speed = Swift.max(revealAnimationRadius, 0.8) * 0.72
+        let forward = normalize(SIMD3<Float>(
+            -sinf(yaw) * cosf(pitch),
+            sinf(pitch),
+            cosf(yaw) * cosf(pitch)
+        ))
+        let right = normalize(simd_cross(SIMD3<Float>(0, 1, 0), forward))
+        let movement = right * input.x + forward * input.y
+        dronePosition += movement * speed * deltaTime
     }
 
     private func updateRevealAnimation() {
