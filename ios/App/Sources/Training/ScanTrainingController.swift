@@ -21,13 +21,19 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
     @Published var previewReloadToken = 0
     @Published var trainingMode: ScanTrainingMode = .fast
 
-    var totalIterations: Int { trainingMode.preset.iterations }
+    var totalIterations: Int {
+        activePreset?.iterations ?? trainingMode.preset(keyframeCount: keyframeCount).iterations
+    }
+
     private let store: MemoScanStore
+    private let keyframeCount: Int
+    private var activePreset: ScanTrainingPreset?
     private var task: Task<Void, Never>?
     private let previewInterval = 120
 
     init(scan: MemoScanRecord, store: MemoScanStore) {
         self.store = store
+        keyframeCount = scan.keyframeCount
         errorMessage = scan.errorMessage
         if scan.canRenderGaussian {
             phase = .rendering(scan.gaussianSplatURL)
@@ -62,13 +68,15 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
 
         task?.cancel()
         phase = .training
+        iteration = 0
         splatCount = 0
         errorMessage = nil
         let rootPath = scan.packageURL.path
         let outputURL = scan.gaussianSplatURL
-        let preset = trainingMode.preset
+        let preset = trainingMode.preset(keyframeCount: scan.keyframeCount)
         let previewInterval = previewInterval
         let fileManager = FileManager.default
+        activePreset = preset
 
         if !FileManager.default.fileExists(atPath: outputURL.path) {
             previewGaussianFileURL = nil
@@ -90,7 +98,11 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
                 ) { stats in
                     await controller.update(stats: stats)
                 }
-                await controller.complete(scan: scan, gaussianFileURL: gaussianFileURL)
+                await controller.complete(
+                    scan: scan,
+                    gaussianFileURL: gaussianFileURL,
+                    iterations: preset.iterations
+                )
             } catch is CancellationError {
             } catch {
                 await controller.fail(scan: scan, error)
@@ -104,6 +116,7 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
         }
         task?.cancel()
         task = nil
+        activePreset = nil
     }
 
     private func update(stats: TrainingProgressSnapshot) {
@@ -119,11 +132,11 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func complete(scan: MemoScanRecord, gaussianFileURL: URL) {
+    private func complete(scan: MemoScanRecord, gaussianFileURL: URL, iterations: Int) {
         do {
             try? FileManager.default.removeItem(at: scan.legacyGaussianPlyURL)
-            _ = try store.markTrained(scan, iterations: trainingMode.preset.iterations)
-            iteration = trainingMode.preset.iterations
+            _ = try store.markTrained(scan, iterations: iterations)
+            iteration = iterations
             previewImage = nil
             if previewGaussianFileURL != gaussianFileURL {
                 previewGaussianFileURL = gaussianFileURL
@@ -131,6 +144,7 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
             }
             phase = .rendering(gaussianFileURL)
             task = nil
+            activePreset = nil
         } catch {
             fail(scan: scan, error)
         }
@@ -141,6 +155,7 @@ final class ScanTrainingController: ObservableObject, @unchecked Sendable {
         store.markTrainingFailed(scan, message: error.localizedDescription)
         phase = .failed
         task = nil
+        activePreset = nil
     }
 
     private nonisolated static func train(
