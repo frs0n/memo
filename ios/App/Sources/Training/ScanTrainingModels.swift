@@ -15,12 +15,18 @@ enum ScanTrainingMode: String, CaseIterable, Identifiable {
         }
     }
 
-    var preset: ScanTrainingPreset {
+    func preset(keyframeCount: Int) -> ScanTrainingPreset {
+        let frameCount = max(keyframeCount, 1)
+
         switch self {
         case .fast:
-            return .fast
+            var preset = ScanTrainingPreset.fast
+            preset.iterations = min(max(frameCount * 8, preset.iterations), 3_200)
+            return preset
         case .quality:
-            return .quality
+            var preset = ScanTrainingPreset.quality
+            preset.iterations = min(max(frameCount * 15, preset.iterations), 7_000)
+            return preset
         }
     }
 }
@@ -36,10 +42,10 @@ struct ScanTrainingPreset: Sendable {
     var densifyGradThresh: Float
 
     static let fast = ScanTrainingPreset(
-        iterations: 1_900,
+        iterations: 2_400,
         imageDownscale: 2,
         numDownscales: 2,
-        resolutionSchedule: 500,
+        resolutionSchedule: 350,
         refineEvery: 150,
         warmupLength: 300,
         resetAlphaEvery: 30,
@@ -50,7 +56,7 @@ struct ScanTrainingPreset: Sendable {
         iterations: 4_500,
         imageDownscale: 2,
         numDownscales: 2,
-        resolutionSchedule: 2_000,
+        resolutionSchedule: 900,
         refineEvery: 100,
         warmupLength: 300,
         resetAlphaEvery: 30,
