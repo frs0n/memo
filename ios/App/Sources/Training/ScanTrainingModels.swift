@@ -5,6 +5,7 @@ import UIKit
 enum ScanTrainingMode: String, CaseIterable, Identifiable {
     case fast
     case quality
+    case adaptive
 
     var id: String { rawValue }
 
@@ -12,6 +13,7 @@ enum ScanTrainingMode: String, CaseIterable, Identifiable {
         switch self {
         case .fast: return "Fast"
         case .quality: return "Quality"
+        case .adaptive: return "Adaptive"
         }
     }
 
@@ -21,6 +23,8 @@ enum ScanTrainingMode: String, CaseIterable, Identifiable {
             return .fast
         case .quality:
             return .quality
+        case .adaptive:
+            return .adaptive
         }
     }
 }
@@ -39,11 +43,14 @@ struct ScanTrainingPreset: Sendable {
         iterations: 1_900,
         imageDownscale: 2,
         numDownscales: 2,
-        resolutionSchedule: 500,
-        refineEvery: 150,
+        // Increase resolution schedule for better mid-stage quality
+        resolutionSchedule: 1_000,
+        // Increase refine interval to reduce densification frequency
+        refineEvery: 200,
         warmupLength: 300,
         resetAlphaEvery: 30,
-        densifyGradThresh: 0.0004
+        // Raise densify threshold to suppress early densification
+        densifyGradThresh: 0.0006
     )
 
     static let quality = ScanTrainingPreset(
@@ -55,6 +62,18 @@ struct ScanTrainingPreset: Sendable {
         warmupLength: 300,
         resetAlphaEvery: 30,
         densifyGradThresh: 0.00022
+    )
+
+    static let adaptive = ScanTrainingPreset(
+        iterations: 3_000,
+        imageDownscale: 2,
+        numDownscales: 2,
+        // Balanced resolution schedule for adaptive mode
+        resolutionSchedule: 1_000,
+        refineEvery: 150,
+        warmupLength: 300,
+        resetAlphaEvery: 30,
+        densifyGradThresh: 0.0003
     )
 
     var trainingConfig: TrainingConfig {
