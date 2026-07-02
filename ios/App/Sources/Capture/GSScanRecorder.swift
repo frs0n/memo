@@ -29,7 +29,7 @@ final class GSScanRecorder {
     private let candidateWindowSize = 8
     private let depthSampleStride = 3
     private let maximumPointCount = 700_000
-    private let pointVoxelSize: Float = 0.012
+    private let pointVoxelSize: Float = 0.006
     private let minimumConsistentDepthNeighbors = 2
 
     private var rootURL: URL?

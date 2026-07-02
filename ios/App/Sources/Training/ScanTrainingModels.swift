@@ -36,14 +36,14 @@ struct ScanTrainingPreset: Sendable {
     var densifyGradThresh: Float
 
     static let fast = ScanTrainingPreset(
-        iterations: 1_900,
+        iterations: 2_500,
         imageDownscale: 2,
         numDownscales: 2,
         resolutionSchedule: 500,
-        refineEvery: 150,
+        refineEvery: 100,
         warmupLength: 300,
         resetAlphaEvery: 30,
-        densifyGradThresh: 0.0004
+        densifyGradThresh: 0.0003
     )
 
     static let quality = ScanTrainingPreset(
